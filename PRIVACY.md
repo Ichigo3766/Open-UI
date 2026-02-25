@@ -1,4 +1,4 @@
-# Open UI Privacy Policy
+# Open UI Privacy Policy 
 
 Effective date: 2026-02-24
 
