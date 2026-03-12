@@ -19,6 +19,7 @@ struct ChatMessageBubble<Content: View>: View {
     @ViewBuilder let content: () -> Content
 
     @Environment(\.theme) private var theme
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     init(
         role: MessageRole,

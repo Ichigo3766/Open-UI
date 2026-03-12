@@ -3,6 +3,17 @@
 ## 📦 NEXT BUILD
 
 ### What's New
+
+### Improvements
+- Full iPad layout overhaul
+
+### Bug Fixes
+
+## Previous Builds
+
+## v1.0.0 — March 12, 2026
+
+### What's New
 - Added `@` model mention — type `@` in the chat input to quickly switch which model handles your message. Pick a model from the fluent popup, and a persistent chip appears in the composer showing the active override. The override stays until you dismiss it or pick a different model, letting you freely switch between models mid-conversation without changing the chat's default.
 - Added Open Terminal integration — enable terminal access for AI models directly from the chat input pill, giving the model the ability to run commands, manage files, and interact with a real Linux environment.
 - Added Terminal File Browser — swipe from the right edge to open a slide-over file panel with directory navigation, breadcrumb path bar, file upload, folder creation, file preview/download, and a built-in mini terminal for running commands directly.
@@ -15,7 +26,7 @@
 - App now sends timezone to the server on login, matching the web client for correct server-side date formatting.
 - Archived chats endpoint now supports search, sort, and filter parameters for faster navigation.
 - Matching formatting of content to the Open WebUI formatting.
-- Sidebar drawer now slides smoothly with your finger
+- Sidebar drawer now slides smoothly with your finger.
 - Returning to an existing chat now remembers the last model used in that conversation instead of reverting to the default model.
 - Unified TTS and STT under a single mlx-audio-swift package, replacing two separate dependencies for smaller app size and easier maintenance.
 - Improved audio transcription for long files with energy-based silence detection for smarter chunking at natural pauses.
@@ -23,7 +34,6 @@
 - User-attached images and files now display inline inside the message bubble instead of floating above it.
 
 ### Bug Fixes
-- Fixed excessive memory usage (1GB+) in long conversations caused by a windowing system that never actually freed off-screen messages due to a self-defeating freeze condition. Replaced with a simple always-render approach which is faster and stutter-free.
 - Fixed chat search using wrong query parameter, which could cause search to silently fail on some server versions.
 - Fixed tag removal using incorrect API endpoint format (path-based instead of body-based DELETE).
 - Fixed tag addition using wrong request body field name.
@@ -36,5 +46,3 @@
 - Fixed chat view becoming pannable in all directions after follow-up suggestions appear, instead of strictly vertical scrolling.
 - Fixed image uploads exceeding the 5 MB API limit by automatically downsampling photos to 2 megapixels before upload.
 - Fixed external response stream not stopping when clicking the stop button.
-
-## Previous Builds

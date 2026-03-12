@@ -54,6 +54,7 @@ struct TerminalBrowserView: View {
             terminalToggleBar
         }
         .background(theme.background)
+        .ignoresSafeArea(.keyboard)
         .task {
             await viewModel.loadDirectory()
         }

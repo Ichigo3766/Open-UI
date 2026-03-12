@@ -4,7 +4,6 @@ import UniformTypeIdentifiers
 
 // MARK: - Chat Attachment
 
-/// Represents an attachment in the chat input.
 struct ChatAttachment: Identifiable {
     let id = UUID()
     let type: AttachmentType
@@ -59,19 +58,6 @@ struct ChatAttachment: Identifiable {
 
 // MARK: - Chat Input Field
 
-/// A sleek, native-feeling chat input field.
-///
-/// Designed to be hosted inside a `safeAreaInset(edge: .bottom)` in
-/// `ChatDetailView`, which handles keyboard offset tracking via
-/// `KeyboardTracker`. This component is purely visual — it does not
-/// manage keyboard height itself.
-///
-/// Features:
-/// - Floating composer with glass background
-/// - Inline + button for attachments/tools
-/// - Inline send / stop / voice button
-/// - Quick-access pill row for web search and tools
-/// - Attachment preview strip
 struct ChatInputField: View {
     @Binding var text: String
     @Binding var attachments: [ChatAttachment]

@@ -7,27 +7,11 @@ import MarkdownView
 
 // MARK: - Chat Detail View
 
-/// The main chat conversation view.
-///
-/// ## Scroll Architecture (iOS 18+)
-/// Uses `ScrollView` + `VStack` + iOS 18 `ScrollPosition` API.
-/// - `scrollPosition($scrollPosition)` drives programmatic scrolling via `scrollTo(edge:)`.
-/// - `StreamingMarkdownView` uses a two-tier update architecture: characters accumulate
-///   at 30fps for smooth typewriter feel, but `MarkdownView` only re-parses at ~7fps,
-///   reducing layout thrashing by ~4x.
-///
-/// ## Keyboard
-/// Keyboard height is tracked by `KeyboardTracker` and applied as a
-/// `safeAreaInset(edge: .bottom)` so the input field lifts with the
-/// keyboard at the exact same animation curve iOS uses — zero lag.
-///
-/// ## Background/Foreground Stability
-/// `adoptServerMessages` in the VM always mutates in-place, so SwiftUI
-/// never destroys and recreates rows — no scroll jumps.
 struct ChatDetailView: View {
     @Environment(AppDependencyContainer.self) private var dependencies
     @Environment(AppRouter.self) private var router
     @Environment(\.theme) private var theme
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     private let initialConversationId: String?
     @State private var viewModel: ChatViewModel
@@ -105,16 +89,14 @@ struct ChatDetailView: View {
         @Bindable var vm = viewModel
 
         ZStack {
-            // Background
             theme.background.ignoresSafeArea()
-
-            // Messages + FAB
             messageListArea
         }
-        // Input field sits in the safe area inset so it lifts with keyboard
         .safeAreaInset(edge: .bottom, spacing: 0) {
             inputFieldArea(vm: vm)
+                .padding(.bottom, keyboard.height)
         }
+        .ignoresSafeArea(.keyboard)
         // Knowledge picker — overlays content (floats over welcome cards / messages)
         .overlay(alignment: .bottom) {
             if vm.isShowingKnowledgePicker {
@@ -183,7 +165,7 @@ struct ChatDetailView: View {
                 viewModel.isTemporaryChat = UserDefaults.standard.bool(forKey: "temporaryChatDefault")
             }
             if randomPrompts.isEmpty {
-                randomPrompts = Self.pickRandomPrompts(count: 4)
+                randomPrompts = Self.pickRandomPrompts(count: promptCardCount)
             }
             NotificationService.shared.activeConversationId =
                 viewModel.conversationId ?? viewModel.conversation?.id
@@ -563,6 +545,26 @@ struct ChatDetailView: View {
         return ["1", "true"].contains(value.lowercased())
     }
     
+    // MARK: - iPad Layout Helpers
+
+    /// Maximum reading width for iPad. Content is centered in the available space.
+    /// On iPhone, this is effectively unlimited (fills the screen).
+    private var iPadMaxContentWidth: CGFloat {
+        horizontalSizeClass == .regular ? 760 : .infinity
+    }
+
+    /// Number of columns in the welcome prompt grid.
+    private var promptColumnCount: Int {
+        horizontalSizeClass == .regular ? 4 : 2
+    }
+
+    /// Number of prompt cards to show (4 cols needs 8, 2 cols needs 4).
+    private var promptCardCount: Int {
+        horizontalSizeClass == .regular ? 8 : 4
+    }
+
+    // MARK: - Message List Area
+
     private var messageListArea: some View {
         ZStack {
             scrollContent
@@ -617,6 +619,10 @@ struct ChatDetailView: View {
             }
             .padding(.top, 8)
             .padding(.bottom, 8)
+            // iPad: constrain content to reading width and center it.
+            // iPhone: fills the full screen (maxWidth: .infinity).
+            .frame(maxWidth: iPadMaxContentWidth)
+            .frame(maxWidth: .infinity)
             // Ensure content fills the viewport so that when there are few
             // messages they appear at the top (alignment: .top) instead of
             // being pushed to the bottom by .defaultScrollAnchor(.bottom).
@@ -1202,9 +1208,10 @@ struct ChatDetailView: View {
 
             Spacer().frame(height: 32)
 
-            // ── Suggested prompt cards ──
-            let rows = stride(from: 0, to: randomPrompts.count, by: 2).map { i in
-                Array(randomPrompts[i..<min(i + 2, randomPrompts.count)])
+            // ── Suggested prompt cards (adaptive grid: 2-col iPhone, 4-col iPad) ──
+            let cols = promptColumnCount
+            let rows = stride(from: 0, to: randomPrompts.count, by: cols).map { i in
+                Array(randomPrompts[i..<min(i + cols, randomPrompts.count)])
             }
             VStack(spacing: 10) {
                 ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
@@ -1212,8 +1219,8 @@ struct ChatDetailView: View {
                         ForEach(row) { prompt in
                             promptCard(prompt)
                         }
-                        // Fill empty slot if row has only 1 item
-                        if row.count < 2 {
+                        // Fill empty slots if row has fewer items than column count
+                        ForEach(0..<(cols - row.count), id: \.self) { _ in
                             Color.clear
                                 .frame(maxWidth: .infinity)
                         }
@@ -1221,6 +1228,7 @@ struct ChatDetailView: View {
                     .padding(.horizontal, Spacing.screenPadding)
                 }
             }
+            .frame(maxWidth: iPadMaxContentWidth)
 
                 Spacer(minLength: 60).layoutPriority(1)
             }

@@ -291,9 +291,17 @@ struct RootView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
     private var authenticatedContent: some View {
-        MainChatView()
-            .sheet(isPresented: $showOnboarding) {
+        Group {
+            if horizontalSizeClass == .regular {
+                iPadMainChatView()
+            } else {
+                MainChatView()
+            }
+        }
+        .sheet(isPresented: $showOnboarding) {
                 OnboardingView(
                     userName: viewModel.currentUser?.displayName ?? "there"
                 ) {
