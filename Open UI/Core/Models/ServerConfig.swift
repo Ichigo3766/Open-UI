@@ -34,6 +34,21 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
     /// Used to skip health check on reconnect and to gate CF-specific behaviour.
     var isCloudflareBotProtected: Bool
 
+    // MARK: - Auth Proxy persistence (Authelia, Authentik, Keycloak, etc.)
+
+    /// Cookies captured from WKWebView after the user authenticated through
+    /// an upstream auth proxy (Authelia, Authentik, Keycloak, oauth2-proxy, etc.).
+    /// Persisted as JSON-encoded `[name: value]` dictionary so they can be
+    /// re-injected into `HTTPCookieStorage.shared` on app restart.
+    var proxyAuthCookies: [String: String]?
+
+    /// Whether this server is known to be behind an auth proxy.
+    /// Used to re-inject proxy cookies on reconnect and to gate proxy-specific behaviour.
+    var isAuthProxyProtected: Bool
+
+    /// The URL the proxy redirected to (auth portal URL) — used to re-scope cookies.
+    var proxyAuthPortalURL: String?
+
     /// API key — stored in Keychain, NOT serialised to UserDefaults.
     /// Populated transiently at runtime via ``KeychainService``.
     var apiKey: String?
@@ -42,6 +57,7 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, name, url, customHeaders, lastConnected, isActive, allowSelfSignedCertificates
         case cfClearanceValue, cfClearanceExpiry, cfUserAgent, isCloudflareBotProtected
+        case proxyAuthCookies, isAuthProxyProtected, proxyAuthPortalURL
     }
 
     init(
@@ -56,7 +72,10 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         cfClearanceValue: String? = nil,
         cfClearanceExpiry: Date? = nil,
         cfUserAgent: String? = nil,
-        isCloudflareBotProtected: Bool = false
+        isCloudflareBotProtected: Bool = false,
+        proxyAuthCookies: [String: String]? = nil,
+        isAuthProxyProtected: Bool = false,
+        proxyAuthPortalURL: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -70,6 +89,9 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         self.cfClearanceExpiry = cfClearanceExpiry
         self.cfUserAgent = cfUserAgent
         self.isCloudflareBotProtected = isCloudflareBotProtected
+        self.proxyAuthCookies = proxyAuthCookies
+        self.isAuthProxyProtected = isAuthProxyProtected
+        self.proxyAuthPortalURL = proxyAuthPortalURL
     }
 
     /// Whether the persisted `cf_clearance` cookie is still valid (not expired).

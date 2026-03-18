@@ -350,6 +350,96 @@ final class APIClient: @unchecked Sendable {
         )
     }
 
+    /// Fetches full model configuration from `/api/v1/models/model?id={id}`.
+    ///
+    /// Unlike `/api/models` (which returns a lightweight list without `params`),
+    /// this endpoint returns the complete model config including:
+    /// - `params.function_calling` — "native" or absent (for default mode)
+    /// - `meta.capabilities` — all capabilities
+    /// - `meta.builtinTools` — which builtin tools are enabled
+    /// - `meta.toolIds` — server-assigned tools
+    /// - `meta.defaultFeatureIds` — default features like web_search, image_generation
+    ///
+    /// Called when a model is selected to get authoritative config for that model.
+    func fetchModelConfig(modelId: String) async throws -> AIModel? {
+        let raw = try await getModelDetails(modelId: modelId)
+        return parseModelConfig(raw)
+    }
+
+    /// Parses a full model config response from `/api/v1/models/model`.
+    /// The schema differs from the `/api/models` list — `params` and `meta` are top-level,
+    /// not nested under `info`.
+    func parseModelConfig(_ raw: [String: Any]) -> AIModel? {
+        guard let id = raw["id"] as? String else { return nil }
+        let name = raw["name"] as? String ?? id
+
+        var isMultimodal = false
+        var supportsRAG = false
+        var capabilities: [String: String]?
+        var profileImageURL: String?
+        var toolIds: [String] = []
+        var defaultFeatureIds: [String] = []
+        var functionCallingMode: String?
+
+        // Top-level `params` (present in single-model endpoint)
+        if let params = raw["params"] as? [String: Any] {
+            if let fc = params["function_calling"] as? String, !fc.isEmpty {
+                functionCallingMode = fc
+            }
+        }
+
+        // Top-level `meta` (present in single-model endpoint)
+        if let meta = raw["meta"] as? [String: Any] {
+            profileImageURL = meta["profile_image_url"] as? String
+            if let caps = meta["capabilities"] as? [String: Any] {
+                isMultimodal = caps["vision"] as? Bool ?? false
+                supportsRAG = caps["citations"] as? Bool ?? false
+                capabilities = caps.compactMapValues { "\($0)" }
+            }
+            if let tools = meta["toolIds"] as? [String] {
+                toolIds = tools
+            }
+            if let defaultFeatures = meta["defaultFeatureIds"] as? [String] {
+                defaultFeatureIds = defaultFeatures
+            }
+        }
+
+        // Fallback: `info.meta` (present in list endpoint — allows reuse for both)
+        if let info = raw["info"] as? [String: Any] {
+            if let meta = info["meta"] as? [String: Any] {
+                if profileImageURL == nil {
+                    profileImageURL = meta["profile_image_url"] as? String
+                }
+                if capabilities == nil, let caps = meta["capabilities"] as? [String: Any] {
+                    isMultimodal = caps["vision"] as? Bool ?? false
+                    supportsRAG = caps["citations"] as? Bool ?? false
+                    capabilities = caps.compactMapValues { "\($0)" }
+                }
+                if toolIds.isEmpty, let tools = meta["toolIds"] as? [String] {
+                    toolIds = tools
+                }
+                if defaultFeatureIds.isEmpty, let defaultFeatures = meta["defaultFeatureIds"] as? [String] {
+                    defaultFeatureIds = defaultFeatures
+                }
+            }
+        }
+
+        return AIModel(
+            id: id,
+            name: name,
+            description: raw["description"] as? String,
+            isMultimodal: isMultimodal,
+            supportsStreaming: true,
+            supportsRAG: supportsRAG,
+            contextLength: raw["context_length"] as? Int,
+            capabilities: capabilities,
+            profileImageURL: profileImageURL,
+            toolIds: toolIds,
+            defaultFeatureIds: defaultFeatureIds,
+            functionCallingMode: functionCallingMode
+        )
+    }
+
     // MARK: - Conversations
 
     /// Fetches conversations including pinned status.
@@ -1641,6 +1731,7 @@ final class APIClient: @unchecked Sendable {
             var profileImageURL: String?
             var toolIds: [String] = []
             var defaultFeatureIds: [String] = []
+            var functionCallingMode: String?
 
             if let info = raw["info"] as? [String: Any] {
                 if let meta = info["meta"] as? [String: Any] {
@@ -1657,6 +1748,15 @@ final class APIClient: @unchecked Sendable {
                         defaultFeatureIds = defaultFeatures
                     }
                 }
+                // Parse function_calling mode from info.params.
+                // OpenWebUI stores this as: info.params.function_calling = "native" | ""
+                // When "native", the model performs native tool calling.
+                // When absent/empty, the server uses its default (non-native) handling.
+                if let params = info["params"] as? [String: Any] {
+                    if let fc = params["function_calling"] as? String, !fc.isEmpty {
+                        functionCallingMode = fc
+                    }
+                }
             }
 
             return AIModel(
@@ -1670,7 +1770,8 @@ final class APIClient: @unchecked Sendable {
                 capabilities: capabilities,
                 profileImageURL: profileImageURL,
                 toolIds: toolIds,
-                defaultFeatureIds: defaultFeatureIds
+                defaultFeatureIds: defaultFeatureIds,
+                functionCallingMode: functionCallingMode
             )
         }
     }

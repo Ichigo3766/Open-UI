@@ -568,7 +568,7 @@ final class SocketIOService: NSObject, @unchecked Sendable, URLSessionWebSocketD
         handleDisconnect(reason: reasonStr)
     }
 
-    func urlSession(
+    nonisolated func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
