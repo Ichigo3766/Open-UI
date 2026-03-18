@@ -376,5 +376,16 @@ struct ServerConnectionView: View {
                 }
             )
         }
+        .fullScreenCover(isPresented: $viewModel.showProxyAuthChallenge) {
+            ProxyAuthView(
+                serverURL: viewModel.serverURL,
+                onSuccess: { cookies, userAgent in
+                    viewModel.resumeAfterProxyAuth(cookies, userAgent: userAgent)
+                },
+                onDismiss: {
+                    viewModel.dismissProxyAuthChallenge()
+                }
+            )
+        }
     }
 }

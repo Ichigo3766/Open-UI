@@ -55,6 +55,10 @@ final class AuthViewModel {
     var showCloudflareChallenge: Bool = false
     /// The normalized URL pending connection after a Cloudflare challenge is solved.
     private var pendingCloudflareURL: String?
+    /// Set to true to present the auth proxy WebView sheet (Authelia, Authentik, etc.).
+    var showProxyAuthChallenge: Bool = false
+    /// The normalized URL pending connection after a proxy auth challenge is solved.
+    private var pendingProxyAuthURL: String?
     /// The OAuth provider key selected by the user (e.g. "google", "microsoft").
     /// Set before navigating to `.ssoLogin` so SSOAuthView can load the provider URL directly.
     var selectedSSOProvider: String?
@@ -271,8 +275,12 @@ final class AuthViewModel {
             showCloudflareChallenge = true
             return
         case .proxyAuthRequired:
-            errorMessage = "Could not connect. If your server is behind Cloudflare or a proxy, ensure the app's IP is allowed through. Otherwise, check your network settings."
+            // The server is behind an auth proxy (Authelia, Authentik, Keycloak, etc.).
+            // Show a WKWebView so the user can authenticate through the proxy portal.
+            // Once done, the proxy session cookies are captured and injected into URLSession.
+            pendingProxyAuthURL = normalizedURL
             isConnecting = false
+            showProxyAuthChallenge = true
             return
         case .unhealthy:
             errorMessage = "Server is reachable but not responding correctly."
@@ -941,6 +949,126 @@ final class AuthViewModel {
         pendingCloudflareURL = nil
         isConnecting = false
         errorMessage = "Security check cancelled. Please try again."
+    }
+
+    // MARK: - Auth Proxy Challenge Handling (Authelia, Authentik, Keycloak, etc.)
+
+    /// Called by `ProxyAuthView` when the user has authenticated through the upstream
+    /// proxy portal and we've captured the resulting session cookies.
+    func resumeAfterProxyAuth(_ cookies: [String: String], userAgent: String) {
+        showProxyAuthChallenge = false
+        guard let urlString = pendingProxyAuthURL else {
+            errorMessage = "Could not resume connection after proxy sign-in."
+            pendingProxyAuthURL = nil
+            return
+        }
+
+        logger.info("🔐 Proxy auth completed — injecting \(cookies.count) cookie(s) and resuming connection to \(urlString)")
+
+        // Inject all captured cookies into HTTPCookieStorage.shared so URLSession
+        // sends them automatically on every subsequent request.
+        guard let url = URL(string: urlString), let host = url.host else {
+            errorMessage = "Invalid server URL after proxy sign-in."
+            pendingProxyAuthURL = nil
+            return
+        }
+        for (name, value) in cookies {
+            let cookieProperties: [HTTPCookiePropertyKey: Any] = [
+                .name: name,
+                .value: value,
+                .domain: host,
+                .path: "/",
+                .secure: url.scheme == "https" ? "TRUE" : "FALSE"
+            ]
+            if let cookie = HTTPCookie(properties: cookieProperties) {
+                HTTPCookieStorage.shared.setCookie(cookie)
+            }
+        }
+
+        serverURL = urlString
+        pendingProxyAuthURL = nil
+
+        Task { await connectSkippingProxyCheck(normalizedURL: urlString, proxyAuthCookies: cookies, userAgent: userAgent) }
+    }
+
+    /// Connects to a server directly, skipping the proxy health check.
+    /// Used after a successful proxy auth challenge where the session cookies are already injected.
+    private func connectSkippingProxyCheck(normalizedURL: String, proxyAuthCookies: [String: String], userAgent: String) async {
+        guard let url = URL(string: normalizedURL), url.host != nil else {
+            errorMessage = "Invalid URL after proxy sign-in."
+            return
+        }
+
+        isConnecting = true
+        errorMessage = nil
+
+        // Persist the User-Agent as a custom header so the proxy session cookies
+        // remain valid (some proxies bind sessions to the UA).
+        var customHeaders: [String: String] = [:]
+        if !userAgent.isEmpty {
+            customHeaders["User-Agent"] = userAgent
+        }
+
+        // Persist all proxy auth data in ServerConfig so it survives app restarts.
+        // On next launch, NetworkManager re-injects the cookies from these fields.
+        let config = ServerConfig(
+            name: url.host ?? "Server",
+            url: normalizedURL,
+            apiKey: apiKey.isEmpty ? nil : apiKey,
+            customHeaders: customHeaders,
+            lastConnected: .now,
+            isActive: true,
+            allowSelfSignedCertificates: allowSelfSignedCerts,
+            proxyAuthCookies: proxyAuthCookies,
+            isAuthProxyProtected: true,
+            proxyAuthPortalURL: normalizedURL
+        )
+
+        let client = APIClient(serverConfig: config)
+
+        if !apiKey.isEmpty {
+            client.updateAuthToken(apiKey)
+        }
+
+        // Skip health check — go straight to verifying it's an OpenWebUI instance
+        guard let configResult = await client.verifyAndGetConfig() else {
+            errorMessage = "Server does not appear to be an OpenWebUI instance."
+            isConnecting = false
+            return
+        }
+
+        backendConfig = configResult
+        logger.info("📋 [connectSkippingProxyCheck] Connected to '\(configResult.name ?? "unknown")' at \(normalizedURL)")
+
+        // Replace any old server config so the proxy-auth-enabled config is active.
+        serverConfigStore.removeAllServers()
+        serverConfigStore.addServer(config)
+        dependencies?.refreshServices()
+
+        if !apiKey.isEmpty {
+            do {
+                currentUser = try await client.getCurrentUser()
+                cacheCurrentUser()
+                phase = .authenticated
+                startTokenRefreshTimer()
+                markOnboardingSeen()
+            } catch {
+                logger.warning("API key auth failed after proxy sign-in: \(error.localizedDescription)")
+                phase = .authMethodSelection
+            }
+        } else {
+            phase = .authMethodSelection
+        }
+
+        isConnecting = false
+    }
+
+    /// Called when the user dismisses the proxy auth challenge without completing it.
+    func dismissProxyAuthChallenge() {
+        showProxyAuthChallenge = false
+        pendingProxyAuthURL = nil
+        isConnecting = false
+        errorMessage = "Sign in cancelled. Please try again."
     }
 
     // MARK: - Private Helpers

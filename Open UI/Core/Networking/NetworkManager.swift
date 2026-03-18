@@ -60,6 +60,29 @@ final class NetworkManager: NSObject, Sendable {
             }
         }
 
+        // Re-inject persisted auth proxy cookies on startup (Authelia, Authentik, etc.).
+        // These are session cookies with no expiry — they vanish when the app terminates,
+        // so we persist the values in ServerConfig and re-create them here on every launch.
+        if serverConfig.isAuthProxyProtected,
+           let proxyAuthCookies = serverConfig.proxyAuthCookies,
+           !proxyAuthCookies.isEmpty,
+           let url = URL(string: serverConfig.url),
+           let host = url.host {
+            for (name, value) in proxyAuthCookies {
+                let cookieProperties: [HTTPCookiePropertyKey: Any] = [
+                    .name: name,
+                    .value: value,
+                    .domain: host,
+                    .path: "/",
+                    .secure: url.scheme == "https" ? "TRUE" : "FALSE"
+                ]
+                if let cookie = HTTPCookie(properties: cookieProperties) {
+                    HTTPCookieStorage.shared.setCookie(cookie)
+                }
+            }
+            logger.info("🔐 Re-injected \(proxyAuthCookies.count) persisted proxy auth cookie(s) for \(host)")
+        }
+
         var headers = configuration.httpAdditionalHeaders ?? [:]
         for (key, value) in serverConfig.customHeaders {
             headers[key] = value
@@ -556,7 +579,7 @@ private final class CertificateTrustDelegate: NSObject, URLSessionDelegate, Send
         super.init()
     }
 
-    func urlSession(
+    nonisolated func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
@@ -569,7 +592,7 @@ private final class CertificateTrustDelegate: NSObject, URLSessionDelegate, Send
             return
         }
 
-        guard let baseURL = serverConfig.apiBaseURL,
+        guard let baseURL = URL(string: serverConfig.url),
               challenge.protectionSpace.host.lowercased() == baseURL.host?.lowercased()
         else {
             completionHandler(.performDefaultHandling, nil)
