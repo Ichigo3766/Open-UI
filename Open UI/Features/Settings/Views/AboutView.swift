@@ -52,14 +52,48 @@ struct AboutView: View {
                         url: "https://github.com/Ichigo3766/Open-UI"
                     )
                     linkRow(
-                        icon: "questionmark.circle",
-                        title: "Help & Support",
-                        url: "https://github.com/Ichigo3766/Open-UI/issues"
-                    )
-                    linkRow(
                         icon: "hand.raised",
                         title: "Privacy Policy",
                         url: "https://github.com/Ichigo3766/Open-UI/blob/main/PRIVACY.md",
+                        showDivider: false
+                    )
+                }
+
+                // Feedback
+                SettingsSection(header: "Feedback") {
+                    linkRow(
+                        icon: "ladybug",
+                        iconColor: .red,
+                        title: "Report a Bug",
+                        subtitle: "Something broken? Let us know.",
+                        url: "https://github.com/Ichigo3766/Open-UI/issues/new?template=bug_report.yml"
+                    )
+                    linkRow(
+                        icon: "sparkles",
+                        iconColor: .purple,
+                        title: "Request a Feature",
+                        subtitle: "Got an idea? We'd love to hear it.",
+                        url: "https://github.com/Ichigo3766/Open-UI/issues/new?template=feature_request.yml"
+                    )
+                    linkRow(
+                        icon: "paintbrush",
+                        iconColor: .orange,
+                        title: "UI/UX Improvement",
+                        subtitle: "Design or layout feedback.",
+                        url: "https://github.com/Ichigo3766/Open-UI/issues/new?template=ui_ux.yml"
+                    )
+                    linkRow(
+                        icon: "bolt",
+                        iconColor: .yellow,
+                        title: "Performance Issue",
+                        subtitle: "Slow, laggy, or draining battery?",
+                        url: "https://github.com/Ichigo3766/Open-UI/issues/new?template=performance.yml"
+                    )
+                    linkRow(
+                        icon: "questionmark.circle",
+                        title: "Ask a Question",
+                        subtitle: "Need help with setup or a feature?",
+                        url: "https://github.com/Ichigo3766/Open-UI/issues/new?template=question.yml",
                         showDivider: false
                     )
                 }
@@ -131,13 +165,17 @@ struct AboutView: View {
 
     private func linkRow(
         icon: String,
+        iconColor: Color? = nil,
         title: String,
+        subtitle: String? = nil,
         url: String,
         showDivider: Bool = true
     ) -> some View {
         SettingsCell(
             icon: icon,
             title: title,
+            subtitle: subtitle,
+            iconColor: iconColor,
             showDivider: showDivider,
             accessory: .chevron
         ) {

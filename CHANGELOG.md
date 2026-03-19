@@ -1,5 +1,18 @@
 # Changelog
 
+## 📦 NEXT BUILD
+
+### What's New
+- Memories fully implemented within the app
+Added Enable Memory toggle in Settings → Personalization → Memories to control whether AI assistants remember context about you across conversations, synced with the web UI.
+
+### Improvements
+- Added a dedicated Feedback section in Settings → About with direct links to structured GitHub issue forms for bug reports, feature requests, UI/UX feedback, performance issues, and questions.
+
+### Bug Fixes
+
+## Previous Builds
+
 ## v1.2.1 — March 18, 2026
 
 ### What's New
