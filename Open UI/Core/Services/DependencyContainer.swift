@@ -133,6 +133,9 @@ final class AppDependencyContainer: ServiceContainer {
     /// The shared auth view model.
     private(set) var authViewModel: AuthViewModel
 
+    /// Weak reference to the app router so services can reset navigation on server switch.
+    weak var router: AppRouter?
+
     /// The current API client, scoped to the active server.
     private(set) var apiClient: APIClient?
 
@@ -247,11 +250,12 @@ final class AppDependencyContainer: ServiceContainer {
         folderManager = apiClient.map { FolderManager(apiClient: $0) }
         notesManager = NotesManager(apiClient: apiClient)
 
+        let serverHost = URL(string: config.url)?.host
+
         // Configure ImageCacheService with CF headers so model avatar images
         // are fetched with the correct User-Agent (Cloudflare ties cf_clearance
         // to the UA that solved the challenge).
         if config.isCloudflareBotProtected {
-            let serverHost = URL(string: config.url)?.host
             Task {
                 await ImageCacheService.shared.configureCFHeaders(
                     customHeaders: config.customHeaders,
@@ -265,6 +269,17 @@ final class AppDependencyContainer: ServiceContainer {
                     serverHost: nil
                 )
             }
+        }
+
+        // Configure ImageCacheService with self-signed cert support so avatar images
+        // load on servers that use self-signed TLS certificates.
+        // Without this, URLSession.shared rejects the SSL handshake and the shimmer
+        // placeholder spins forever (issue #4).
+        Task {
+            await ImageCacheService.shared.configureSelfSignedCertSupport(
+                allowed: config.allowSelfSignedCertificates,
+                serverHost: config.allowSelfSignedCertificates ? serverHost : nil
+            )
         }
 
         // Configure file attachment service

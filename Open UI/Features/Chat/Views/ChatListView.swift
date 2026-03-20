@@ -18,23 +18,24 @@ struct ChatListView: View {
     @State private var showCreateFolderSheet = false
     @State private var folderToRename: ChatFolder?
 
+    // Share sheet state
+    @State private var sharingConversation: Conversation?
+
     // Tracks whether the "Chats" header drop zone is highlighted
     @State private var chatsDropTargetActive: Bool = false
 
     var body: some View {
         @Bindable var router = router
         let folderVM = viewModel.folderViewModel
+        let isEmpty = viewModel.conversations.isEmpty && folderVM.folders.isEmpty
 
         NavigationStack(path: $router.path) {
             Group {
                 if viewModel.isLoading && viewModel.conversations.isEmpty {
                     loadingView
-                } else if viewModel.conversations.isEmpty
-                            && folderVM.folders.isEmpty
-                            && viewModel.errorMessage == nil {
+                } else if isEmpty && viewModel.errorMessage == nil {
                     emptyStateView
-                } else if let error = viewModel.errorMessage,
-                          viewModel.conversations.isEmpty {
+                } else if let error = viewModel.errorMessage, viewModel.conversations.isEmpty {
                     errorView(error)
                 } else {
                     conversationList
@@ -91,9 +92,7 @@ struct ChatListView: View {
             }
             // Create folder sheet
             .sheet(isPresented: $showCreateFolderSheet) {
-                CreateFolderSheet(onCreate: { name in
-                    Task { await viewModel.folderViewModel.createFolder(name: name) }
-                })
+                createFolderSheet
             }
             // Rename folder sheet
             .sheet(item: $folderToRename) { folder in
@@ -101,6 +100,23 @@ struct ChatListView: View {
                     viewModel.folderViewModel.renameText = newName
                     Task { await viewModel.folderViewModel.commitRename() }
                 })
+            }
+            // Share chat sheet
+            .sheet(item: $sharingConversation) { conversation in
+                if let apiClient = dependencies.apiClient {
+                    ShareChatSheet(
+                        conversation: conversation,
+                        apiClient: apiClient,
+                        serverBaseURL: apiClient.baseURL,
+                        onShareIdUpdated: { shareId in
+                            viewModel.updateShareId(for: conversation.id, shareId: shareId)
+                        },
+                        onClone: { cloned in
+                            router.navigate(to: .chatDetail(conversationId: cloned.id))
+                        }
+                    )
+                    .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+                }
             }
             .refreshable {
                 await withTaskGroup(of: Void.self) { group in
@@ -370,6 +386,15 @@ struct ChatListView: View {
         }
     }
 
+    // MARK: - Create Folder Sheet (extracted to help type-checker)
+
+    private var createFolderSheet: some View {
+        CreateFolderSheet(apiClient: dependencies.apiClient) { name, data, meta in
+            let folderVM = viewModel.folderViewModel
+            Task { await folderVM.createFolder(name: name, parentId: nil, data: data, meta: meta) }
+        }
+    }
+
     // MARK: - Error View
 
     private func errorView(_ message: String) -> some View {
@@ -450,21 +475,20 @@ struct ChatListView: View {
                 Section(section) {
                     ForEach(conversations) { conversation in
                         conversationRow(conversation, isPinned: false)
-                            .task { await viewModel.loadMoreIfNeeded(currentItem: conversation) }
                     }
                 }
                 .accessibilityAddTraits(.isHeader)
             }
 
-            // Loading more indicator
-            if viewModel.isLoadingMore {
+            // Background fetch indicator — shown while remaining pages load
+            if viewModel.isFetchingAllPages {
                 HStack {
                     Spacer()
                     ProgressView().controlSize(.small).padding(.vertical, Spacing.md)
                     Spacer()
                 }
                 .listRowSeparator(.hidden)
-                .accessibilityLabel(Text("Loading more conversations"))
+                .accessibilityLabel(Text("Loading all conversations"))
             }
         }
         .listStyle(.insetGrouped)
@@ -615,7 +639,7 @@ struct ChatListView: View {
                         isPinned: conversation.pinned,
                         onArchive: { Task { await viewModel.toggleArchive(conversation: conversation) } },
                         onShare: {
-                            Task { _ = await viewModel.shareConversation(conversation) }
+                            sharingConversation = conversation
                         },
                         onUnshare: {
                             Task { await viewModel.unshareConversation(conversation) }

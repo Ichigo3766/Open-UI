@@ -18,6 +18,8 @@ struct MemoriesView: View {
     @State private var editText = ""
     @State private var showClearAllConfirmation = false
     @State private var isClearingAll = false
+    @State private var memoryEnabled = false
+    @State private var isLoadingMemoryToggle = false
 
     var body: some View {
         Group {
@@ -29,8 +31,6 @@ struct MemoriesView: View {
                         .foregroundStyle(theme.textTertiary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if memories.isEmpty && !isAddingMemory {
-                emptyState
             } else {
                 memoryList
             }
@@ -49,6 +49,7 @@ struct MemoriesView: View {
         }
         .task {
             await loadMemories()
+            await loadMemoryToggle()
         }
         .destructiveConfirmation(
             isPresented: $showClearAllConfirmation,
@@ -82,6 +83,22 @@ struct MemoriesView: View {
 
     private var memoryList: some View {
         List {
+            // Memory enabled toggle
+            Section {
+                Toggle(isOn: $memoryEnabled) {
+                    Label("Enable Memory", systemImage: "brain")
+                }
+                .tint(theme.brandPrimary)
+                .disabled(isLoadingMemoryToggle)
+                .onChange(of: memoryEnabled) { _, newValue in
+                    Task { await updateMemoryToggle(newValue) }
+                }
+            } header: {
+                Text("Memory")
+            } footer: {
+                Text("When enabled, the AI remembers context about you across conversations.")
+            }
+
             // Add new memory section
             if isAddingMemory {
                 Section {
@@ -126,8 +143,41 @@ struct MemoriesView: View {
                 }
             }
 
-            // Existing memories
+            // Existing memories or empty message
             Section {
+                if memories.isEmpty && !isAddingMemory {
+                    // Empty state inside the list
+                    VStack(spacing: Spacing.md) {
+                        Image(systemName: "brain")
+                            .scaledFont(size: 48)
+                            .foregroundStyle(theme.textTertiary.opacity(0.5))
+                            .padding(.top, Spacing.lg)
+                        
+                        Text("No Memories")
+                            .scaledFont(size: 20, weight: .semibold)
+                            .foregroundStyle(theme.textPrimary)
+                        
+                        Text("Memories help the AI remember important context about you across conversations.")
+                            .scaledFont(size: 14)
+                            .foregroundStyle(theme.textSecondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, Spacing.lg)
+                        
+                        Button {
+                            withAnimation { isAddingMemory = true }
+                        } label: {
+                            Label("Add Memory", systemImage: "plus.circle")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(theme.brandPrimary)
+                        .padding(.top, Spacing.sm)
+                        .padding(.bottom, Spacing.xl)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
+                }
+                
                 ForEach(memories, id: \.memoryId) { memory in
                     let memId = memory["id"] as? String ?? ""
                     let content = memory["content"] as? String ?? ""
@@ -307,6 +357,27 @@ struct MemoriesView: View {
         }
 
         isClearingAll = false
+    }
+
+    private func loadMemoryToggle() async {
+        guard let api = dependencies.apiClient else { return }
+        isLoadingMemoryToggle = true
+        if let settings = try? await api.getUserSettings(),
+           let ui = settings["ui"] as? [String: Any],
+           let enabled = ui["memory"] as? Bool {
+            memoryEnabled = enabled
+        }
+        isLoadingMemoryToggle = false
+    }
+
+    private func updateMemoryToggle(_ enabled: Bool) async {
+        guard let api = dependencies.apiClient else { return }
+        isLoadingMemoryToggle = true
+        try? await api.updateUserSettings(["ui": ["memory": enabled as Any]])
+        isLoadingMemoryToggle = false
+        // Notify all active ChatViewModels so they update immediately
+        // without waiting for the next server fetch on model switch/reload.
+        NotificationCenter.default.post(name: .memorySettingChanged, object: enabled)
     }
 }
 

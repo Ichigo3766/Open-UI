@@ -272,6 +272,7 @@ struct ChannelDetailView: View {
                                 showError("Failed to remove members: \(error.localizedDescription)")
                             }
                         },
+                        apiClient: dependencies.apiClient,
                         editingChannel: channel,
                         allUsers: viewModel.allServerUsers,
                         channelMembers: viewModel.members
@@ -416,34 +417,42 @@ struct ChannelDetailView: View {
                 standardToolbarTitle
             }
         }
-        ToolbarItemGroup(placement: .topBarTrailing) {
-            Button {
-                Task { await viewModel.loadPinnedMessages() }
-                viewModel.showPinnedSheet = true
-            } label: {
-                Image(systemName: "pin")
-                    .scaledFont(size: 13, weight: .medium)
-            }
-            
-            Button {
-                Task { await viewModel.loadMembers() }
-                viewModel.showMembersSheet = true
-            } label: {
-                Image(systemName: "person.2")
-                    .scaledFont(size: 13, weight: .medium)
-            }
-            
-            if viewModel.canManageChannel {
+        ToolbarItem(placement: .topBarTrailing) {
+            HStack(spacing: 0) {
                 Button {
-                    Task {
-                        async let channelRefresh: () = viewModel.loadChannel()
-                        async let usersRefresh: () = viewModel.loadAllServerUsers()
-                        _ = await (channelRefresh, usersRefresh)
-                        showChannelSettings = true
-                    }
+                    Task { await viewModel.loadPinnedMessages() }
+                    viewModel.showPinnedSheet = true
                 } label: {
-                    Image(systemName: "gearshape")
-                        .scaledFont(size: 13, weight: .medium)
+                    Image(systemName: "pin")
+                        .scaledFont(size: 12, weight: .medium)
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                }
+                
+                Button {
+                    Task { await viewModel.loadMembers() }
+                    viewModel.showMembersSheet = true
+                } label: {
+                    Image(systemName: "person.2")
+                        .scaledFont(size: 12, weight: .medium)
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                }
+                
+                if viewModel.canManageChannel {
+                    Button {
+                        Task {
+                            async let channelRefresh: () = viewModel.loadChannel()
+                            async let usersRefresh: () = viewModel.loadAllServerUsers()
+                            _ = await (channelRefresh, usersRefresh)
+                            showChannelSettings = true
+                        }
+                    } label: {
+                        Image(systemName: "gearshape")
+                            .scaledFont(size: 12, weight: .medium)
+                            .frame(width: 30, height: 30)
+                            .contentShape(Rectangle())
+                    }
                 }
             }
         }
@@ -483,15 +492,10 @@ struct ChannelDetailView: View {
     
     private var groupToolbarTitle: some View {
         VStack(spacing: 1) {
-            HStack(spacing: 4) {
-                Image(systemName: "person.3")
-                    .scaledFont(size: 11, weight: .semibold)
-                    .foregroundStyle(theme.textTertiary)
-                Text(viewModel.channel?.name ?? "Group")
-                    .scaledFont(size: 15, weight: .semibold)
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(1)
-            }
+            Text(viewModel.channel?.name ?? "Group")
+                .scaledFont(size: 15, weight: .semibold)
+                .foregroundStyle(theme.textPrimary)
+                .lineLimit(1)
             if !viewModel.members.isEmpty {
                 Text("\(viewModel.members.count) members")
                     .scaledFont(size: 11)
@@ -507,17 +511,10 @@ struct ChannelDetailView: View {
     
     private var standardToolbarTitle: some View {
         VStack(spacing: 1) {
-            HStack(spacing: 4) {
-                if let channel = viewModel.channel {
-                    Image(systemName: channel.isPrivate ? "lock" : "number")
-                        .scaledFont(size: 11, weight: .semibold)
-                        .foregroundStyle(theme.textTertiary)
-                }
-                Text(viewModel.channel?.name ?? "Channel")
-                    .scaledFont(size: 15, weight: .semibold)
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(1)
-            }
+            Text(viewModel.channel?.name ?? "Channel")
+                .scaledFont(size: 15, weight: .semibold)
+                .foregroundStyle(theme.textPrimary)
+                .lineLimit(1)
             if let desc = viewModel.channel?.description, !desc.isEmpty {
                 Text(desc)
                     .scaledFont(size: 11)
@@ -1209,9 +1206,18 @@ struct ChannelDetailView: View {
     private var emptyChannelView: some View {
         VStack(spacing: Spacing.md) {
             if viewModel.isDM {
-                Image(systemName: "person.crop.circle")
-                    .scaledFont(size: 40)
-                    .foregroundStyle(Color.green.opacity(0.5))
+                if let participant = viewModel.dmOtherParticipant {
+                    UserAvatar(
+                        size: 56,
+                        imageURL: participant.resolveAvatarURL(serverBaseURL: viewModel.serverBaseURL),
+                        name: participant.displayName,
+                        authToken: viewModel.serverAuthToken
+                    )
+                } else {
+                    Image(systemName: "person.crop.circle")
+                        .scaledFont(size: 40)
+                        .foregroundStyle(Color.green.opacity(0.5))
+                }
                 Text("Say hello to \(viewModel.channelDisplayTitle)")
                     .scaledFont(size: 16, weight: .medium)
                     .foregroundStyle(theme.textSecondary)

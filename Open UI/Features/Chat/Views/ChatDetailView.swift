@@ -80,8 +80,23 @@ struct ChatDetailView: View {
 
     init(viewModel: ChatViewModel) {
         self.initialConversationId = nil
+        self._folderWorkspace = nil
         self._viewModel = State(initialValue: viewModel)
     }
+
+    // MARK: - Folder Workspace Init
+
+    /// Creates a ChatDetailView in "folder workspace" mode.
+    /// When `folderWorkspace` is set, the welcome/empty state shows the folder
+    /// icon + name centered (matching the web UI). New chats are created inside
+    /// the folder with its system prompt injected.
+    init(viewModel: ChatViewModel, folderWorkspace: ChatFolder?) {
+        self.initialConversationId = nil
+        self._folderWorkspace = folderWorkspace
+        self._viewModel = State(initialValue: viewModel)
+    }
+
+    private var _folderWorkspace: ChatFolder?
 
     // MARK: - Body
 
@@ -185,24 +200,22 @@ struct ChatDetailView: View {
             if viewModel.isNewConversation {
                 viewModel.isTemporaryChat = UserDefaults.standard.bool(forKey: "temporaryChatDefault")
             }
-            if randomPrompts.isEmpty {
-                randomPrompts = Self.buildServerPrompts(
-                    from: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions,
-                    count: promptCardCount
-                )
-            }
+            // Prompts are populated via the .onChange(initial: true) below —
+        // no need to build them here. The onChange fires synchronously on
+        // first evaluation, so prompts are always in sync with backendConfig.
             NotificationService.shared.activeConversationId =
                 viewModel.conversationId ?? viewModel.conversation?.id
             await viewModel.load()
         }
-        // Reactive fallback: if backendConfig wasn't ready when .task ran
-        // (first app launch), rebuild prompts as soon as the config arrives.
-        // Watch the suggestion count (Int?) — always Equatable, avoids
-        // asking the type-checker to diff the entire BackendConfig struct.
-        .onChange(of: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions?.count) { _, _ in
-            // Always rebuild when the server config changes — this handles both the
-            // first-launch timing case (randomPrompts is empty) AND the case where
-            // the admin updates suggestions on the server while the app is running.
+        // Build welcome prompts from server config — fires immediately on first render
+        // (initial: true) AND whenever the config changes later. This covers:
+        //   • First app launch: backendConfig loads asynchronously after view appears.
+        //     initial: true fires once synchronously on view attach (prompts = [] if
+        //     config not yet ready), then fires again when config arrives.
+        //   • Subsequent launches: config is already loaded — initial: true fires
+        //     synchronously with the correct data, so prompts are populated instantly.
+        //   • Admin updates suggestions while app is running — fires on count change.
+        .onChange(of: dependencies.authViewModel.backendConfig?.defaultPromptSuggestions?.count, initial: true) { _, _ in
             let suggestions = dependencies.authViewModel.backendConfig?.defaultPromptSuggestions
             randomPrompts = Self.buildServerPrompts(from: suggestions, count: promptCardCount)
         }
@@ -640,8 +653,13 @@ struct ChatDetailView: View {
 
             // Welcome screen — shown when no messages and not loading
             if !viewModel.isLoadingConversation && viewModel.messages.isEmpty {
-                welcomeView
-                    .transition(.opacity.animation(.easeInOut(duration: 0.2)))
+                if let folder = _folderWorkspace {
+                    folderWelcomeView(folder: folder)
+                        .transition(.opacity.animation(.easeInOut(duration: 0.2)))
+                } else {
+                    welcomeView
+                        .transition(.opacity.animation(.easeInOut(duration: 0.2)))
+                }
             }
         }
         // FAB overlay
@@ -1324,6 +1342,89 @@ struct ChatDetailView: View {
             }
         }
         .scrollDismissesKeyboard(.interactively)
+    }
+
+    // MARK: - Folder Workspace Welcome View
+
+    /// Shown instead of the generic "How can I help?" welcome when the user
+    /// navigates into a folder workspace. Mirrors the Open WebUI web design:
+    /// large folder icon + folder name centred, with a hint that new chats
+    /// will be created inside this folder.
+    @ViewBuilder
+    private func folderWelcomeView(folder: ChatFolder) -> some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 60).layoutPriority(1)
+
+            VStack(spacing: Spacing.md) {
+                // Folder icon
+                ZStack {
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .fill(theme.brandPrimary.opacity(0.12))
+                        .frame(width: 72, height: 72)
+                    Image(systemName: "folder.fill")
+                        .scaledFont(size: 34, weight: .medium)
+                        .foregroundStyle(theme.brandPrimary)
+                }
+
+                // Folder name
+                Text(folder.name)
+                    .scaledFont(size: 26, weight: .bold)
+                    .foregroundStyle(theme.textPrimary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+
+                // Subtitle hint
+                Text("New chats will be saved to this folder")
+                    .scaledFont(size: 13, weight: .regular)
+                    .foregroundStyle(theme.textTertiary)
+                    .multilineTextAlignment(.center)
+
+                // Show system prompt badge if the folder has one
+                if let systemPrompt = folder.systemPrompt,
+                   !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    HStack(spacing: Spacing.xs) {
+                        Image(systemName: "text.bubble")
+                            .scaledFont(size: 11, weight: .medium)
+                        Text("Custom system prompt active")
+                            .scaledFont(size: 11, weight: .medium)
+                    }
+                    .foregroundStyle(theme.brandPrimary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 5)
+                    .background(theme.brandPrimary.opacity(0.1))
+                    .clipShape(Capsule())
+                }
+
+                // Show configured model badge if the folder has default models
+                if let firstModel = folder.modelIds.first, !firstModel.isEmpty {
+                    let modelName = viewModel.availableModels.first(where: { $0.id == firstModel })?.shortName ?? firstModel
+                    HStack(spacing: Spacing.xs) {
+                        Image(systemName: "cpu")
+                            .scaledFont(size: 11, weight: .medium)
+                        Text(modelName)
+                            .scaledFont(size: 11, weight: .medium)
+                    }
+                    .foregroundStyle(theme.textSecondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 5)
+                    .background(theme.surfaceContainer.opacity(0.6))
+                    .clipShape(Capsule())
+                    .overlay(
+                        Capsule()
+                            .strokeBorder(theme.cardBorder.opacity(0.4), lineWidth: 0.5)
+                    )
+                }
+            }
+            .padding(.horizontal, Spacing.screenPadding)
+
+            Spacer(minLength: 60).layoutPriority(1)
+        }
+        .frame(maxWidth: iPadMaxContentWidth)
+        .frame(maxWidth: .infinity)
+        .onTapGesture {
+            UIApplication.shared.sendAction(
+                #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        }
     }
 
     @ViewBuilder

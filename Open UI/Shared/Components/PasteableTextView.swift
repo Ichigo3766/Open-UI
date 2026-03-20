@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+import GameController
 
 // MARK: - Pasteable Text View
 
@@ -329,6 +330,9 @@ final class PasteInterceptingTextView: UITextView {
     /// Whether Return key sends the message instead of inserting a newline.
     var sendOnReturn: Bool = true
 
+    /// Tracks whether the Shift key is currently held on a hardware keyboard.
+    private var isShiftHeld: Bool = false
+
     /// Placeholder label shown when the text view is empty.
     lazy var placeholderLabel: UILabel = {
         let label = UILabel()
@@ -451,11 +455,63 @@ final class PasteInterceptingTextView: UITextView {
         super.paste(sender)
     }
 
+    // MARK: - Hardware Keyboard Detection
+
+    /// Returns true when a physical keyboard is connected to the device.
+    private var isHardwareKeyboardConnected: Bool {
+        GCKeyboard.coalesced != nil
+    }
+
+    // MARK: - Modifier Key Tracking
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses {
+            if let key = press.key {
+                if key.keyCode == .keyboardLeftShift || key.keyCode == .keyboardRightShift {
+                    isShiftHeld = true
+                }
+            }
+        }
+        super.pressesBegan(presses, with: event)
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses {
+            if let key = press.key {
+                if key.keyCode == .keyboardLeftShift || key.keyCode == .keyboardRightShift {
+                    isShiftHeld = false
+                }
+            }
+        }
+        super.pressesEnded(presses, with: event)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses {
+            if let key = press.key {
+                if key.keyCode == .keyboardLeftShift || key.keyCode == .keyboardRightShift {
+                    isShiftHeld = false
+                }
+            }
+        }
+        super.pressesCancelled(presses, with: event)
+    }
+
     // MARK: - Return Key Handling
 
     override func insertText(_ text: String) {
         if text == "\n" && sendOnReturn {
-            onReturnKey?()
+            if isHardwareKeyboardConnected {
+                // Hardware keyboard: Shift+Enter inserts a newline, bare Enter sends.
+                if isShiftHeld {
+                    super.insertText(text)
+                } else {
+                    onReturnKey?()
+                }
+            } else {
+                // Software keyboard: honour the sendOnReturn preference (existing behaviour).
+                onReturnKey?()
+            }
             return
         }
         super.insertText(text)

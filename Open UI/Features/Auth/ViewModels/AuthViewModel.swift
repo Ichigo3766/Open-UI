@@ -22,6 +22,8 @@ enum AuthPhase: Equatable {
     case ssoLogin
     /// Authenticated; ready to use.
     case authenticated
+    /// Shows the list of saved server profiles for quick switching.
+    case serverSwitcher
 }
 
 /// Describes the type of authentication used.
@@ -39,6 +41,8 @@ final class AuthViewModel {
 
     var serverURL: String = ""
     var apiKey: String = ""
+    /// User-supplied custom HTTP headers (key–value pairs) entered during server setup.
+    var customHeaderEntries: [CustomHeaderEntry] = []
     var email: String = ""
     var password: String = ""
     var ldapUsername: String = ""
@@ -195,7 +199,7 @@ final class AuthViewModel {
         if let active = serverConfigStore.activeServer {
             serverURL = active.url
             if KeychainService.shared.hasToken(forServer: active.url),
-               let cachedUser = Self.loadCachedUser() {
+               let cachedUser = Self.loadCachedUser(forServer: active.url) {
                 // Instant launch — user sees chat immediately
                 currentUser = cachedUser
                 phase = .authenticated
@@ -203,6 +207,16 @@ final class AuthViewModel {
             } else if KeychainService.shared.hasToken(forServer: active.url) {
                 // Have token but no cached user — must validate (first launch after update)
                 phase = .restoringSession
+            } else {
+                // Server saved but no token (signed out). Decision:
+                // - If only ONE server is saved → go straight to its login screen (best UX for single-server users).
+                // - If MULTIPLE servers are saved → show the server list so the user
+                //   can choose which server to sign into, rather than auto-picking one.
+                if serverConfigStore.servers.count > 1 {
+                    phase = .serverSwitcher
+                } else {
+                    phase = .authMethodSelection
+                }
             }
         }
     }
@@ -244,10 +258,19 @@ final class AuthViewModel {
             return
         }
 
+        // Build the user-supplied custom headers dict (skip blank entries)
+        let userCustomHeaders: [String: String] = Dictionary(
+            customHeaderEntries
+                .filter { !$0.key.trimmingCharacters(in: .whitespaces).isEmpty }
+                .map { ($0.key.trimmingCharacters(in: .whitespaces), $0.value) },
+            uniquingKeysWith: { _, last in last }
+        )
+
         let config = ServerConfig(
             name: url.host ?? "Server",
             url: normalizedURL,
             apiKey: apiKey.isEmpty ? nil : apiKey,
+            customHeaders: userCustomHeaders,
             lastConnected: .now,
             isActive: true,
             allowSelfSignedCertificates: allowSelfSignedCerts
@@ -260,10 +283,36 @@ final class AuthViewModel {
             client.updateAuthToken(apiKey)
         }
 
-        // Health check with proxy detection
-        let healthResult = await client.checkHealthWithProxyDetection()
+        // Health check with proxy detection — also detects HTTP→HTTPS redirects from
+        // a load balancer so we can update the stored URL to the correct HTTPS address.
+        let healthCheck = await client.checkHealthWithProxyDetectionAndFinalURL()
 
-        switch healthResult {
+        // If the load balancer redirected HTTP→HTTPS, update normalizedURL so all
+        // subsequent requests (login, SSO, /api/config) go to the HTTPS address.
+        // We also need a fresh client and config pointing at the HTTPS URL.
+        var activeConfig = config
+        var activeClient = client
+        if let redirectedURL = healthCheck.finalURL {
+            logger.info("🔀 [connect] HTTP→HTTPS redirect detected: \(normalizedURL) → \(redirectedURL)")
+            normalizedURL = redirectedURL
+            serverURL = redirectedURL
+            // Rebuild config + client with the corrected HTTPS URL
+            activeConfig = ServerConfig(
+                name: URL(string: redirectedURL)?.host ?? "Server",
+                url: redirectedURL,
+                apiKey: apiKey.isEmpty ? nil : apiKey,
+                customHeaders: userCustomHeaders,
+                lastConnected: .now,
+                isActive: true,
+                allowSelfSignedCertificates: allowSelfSignedCerts
+            )
+            activeClient = APIClient(serverConfig: activeConfig)
+            if !apiKey.isEmpty {
+                activeClient.updateAuthToken(apiKey)
+            }
+        }
+
+        switch healthCheck.result {
         case .healthy:
             break
         case .cloudflareChallenge:
@@ -295,8 +344,8 @@ final class AuthViewModel {
         // Verify it's an OpenWebUI server. This also probes /api/config, which
         // Cloudflare can independently challenge even if /health passed.
         // If it fails, do a second Cloudflare check before giving up.
-        guard let config_result = await client.verifyAndGetConfig() else {
-            let cfCheck = await client.checkHealthWithProxyDetection()
+        guard let config_result = await activeClient.verifyAndGetConfig() else {
+            let cfCheck = await activeClient.checkHealthWithProxyDetection()
             if cfCheck == .cloudflareChallenge {
                 pendingCloudflareURL = normalizedURL
                 isConnecting = false
@@ -310,13 +359,19 @@ final class AuthViewModel {
 
         backendConfig = config_result
         logger.info("📋 [connect] backendConfig set — name='\(config_result.name ?? "nil")', version='\(config_result.version ?? "nil")', features_nil=\(config_result.features == nil), isSignupEnabled=\(self.isSignupEnabled), isLoginEnabled=\(self.isLoginEnabled), oauthProviders=\(config_result.oauthProviders?.enabledProviders.joined(separator: ",") ?? "none"), isValidOpenWebUI=\(config_result.isValidOpenWebUI)")
-        serverConfigStore.addServer(config)
+        // Upsert the new server. For multi-server scenarios the new server
+        // must be made active explicitly — addServer() only auto-activates
+        // the very first server in an empty list.
+        serverConfigStore.addServer(activeConfig)
+        if let saved = serverConfigStore.server(forURL: normalizedURL) {
+            serverConfigStore.setActiveServer(id: saved.id)
+        }
         dependencies?.refreshServices()
 
         // If API key was provided, try to authenticate immediately
         if !apiKey.isEmpty {
             do {
-                currentUser = try await client.getCurrentUser()
+                currentUser = try await activeClient.getCurrentUser()
                 cacheCurrentUser()
                 phase = .authenticated
                 startTokenRefreshTimer()
@@ -378,6 +433,7 @@ final class AuthViewModel {
             dependencies?.activeChatStore.clear()
             connectSocketWithToken()
             cacheCurrentUser()
+            backendConfig = try? await client.getBackendConfig()
             phase = .authenticated
             startTokenRefreshTimer()
             logger.info("Login successful for \(self.email)")
@@ -445,6 +501,7 @@ final class AuthViewModel {
             dependencies?.activeChatStore.clear()
             connectSocketWithToken()
             cacheCurrentUser()
+            backendConfig = try? await client.getBackendConfig()
             phase = .authenticated
             startTokenRefreshTimer()
             // New users should always see onboarding
@@ -498,6 +555,7 @@ final class AuthViewModel {
             dependencies?.activeChatStore.clear()
             connectSocketWithToken()
             cacheCurrentUser()
+            backendConfig = try? await client.getBackendConfig()
             phase = .authenticated
             startTokenRefreshTimer()
             logger.info("LDAP login successful for \(self.ldapUsername)")
@@ -534,6 +592,7 @@ final class AuthViewModel {
             dependencies?.activeChatStore.clear()
             connectSocketWithToken()
             cacheCurrentUser()
+            backendConfig = try? await client.getBackendConfig()
             phase = .authenticated
             startTokenRefreshTimer()
             logger.info("SSO login successful")
@@ -756,7 +815,13 @@ final class AuthViewModel {
         case .credentialLogin, .ldapLogin, .ssoLogin, .signUp:
             phase = .authMethodSelection
         case .authMethodSelection:
-            phase = .serverConnection
+            // If we have a saved server, don't go back to a blank URL screen.
+            // Only go to serverConnection if there truly is no server saved.
+            if serverConfigStore.servers.isEmpty {
+                phase = .serverConnection
+            }
+            // If servers are saved, stay on authMethodSelection — the user is on the
+            // right server, they just need to pick a login method.
         default:
             break
         }
@@ -909,11 +974,14 @@ final class AuthViewModel {
         backendConfig = configResult
         logger.info("📋 [connectSkippingHealthCheck] Connected to '\(configResult.name ?? "unknown")' at \(normalizedURL)")
 
-        // Remove any previously stored server configs so the CF-enabled config
-        // becomes the single active server. Without this, addServer() appends and
-        // the OLD server (without CF headers) is still returned as activeServer.
-        serverConfigStore.removeAllServers()
+        // Upsert the CF-enabled config (preserves other saved servers).
+        // addServer() deduplicates by URL so if this server was already saved
+        // it gets updated with the CF headers; if new, it's appended.
         serverConfigStore.addServer(config)
+        // Activate this server without destroying others
+        if let saved = serverConfigStore.server(forURL: normalizedURL) {
+            serverConfigStore.setActiveServer(id: saved.id)
+        }
         dependencies?.refreshServices()
 
         if !apiKey.isEmpty {
@@ -1040,9 +1108,11 @@ final class AuthViewModel {
         backendConfig = configResult
         logger.info("📋 [connectSkippingProxyCheck] Connected to '\(configResult.name ?? "unknown")' at \(normalizedURL)")
 
-        // Replace any old server config so the proxy-auth-enabled config is active.
-        serverConfigStore.removeAllServers()
+        // Upsert the proxy-auth config (preserves other saved servers).
         serverConfigStore.addServer(config)
+        if let saved = serverConfigStore.server(forURL: normalizedURL) {
+            serverConfigStore.setActiveServer(id: saved.id)
+        }
         dependencies?.refreshServices()
 
         if !apiKey.isEmpty {
@@ -1073,6 +1143,13 @@ final class AuthViewModel {
 
     // MARK: - Private Helpers
 
+    /// Public version of `ensureBackendConfig` — called by `RootView` on launch
+    /// when the app starts in `.authMethodSelection` (signed-out state) so that
+    /// login/SSO options are populated without requiring the user to tap anything.
+    func fetchBackendConfigIfNeeded() async {
+        await ensureBackendConfig()
+    }
+
     /// Ensures `backendConfig` is populated by fetching it from the server.
     /// Called before transitioning to `authMethodSelection` so that OAuth providers,
     /// signup availability, etc. are all visible.
@@ -1101,31 +1178,53 @@ final class AuthViewModel {
         }
     }
 
-    // MARK: - User Cache (for optimistic auth)
+    // MARK: - User Cache (per-server, for optimistic auth)
 
-    /// Persists the current user to Keychain so the next launch can skip
-    /// the "Connecting…" spinner and go straight to the chat screen.
+    /// Persists the current user to Keychain scoped to the active server URL so the
+    /// next launch can skip the "Connecting…" spinner and go straight to the chat screen.
+    ///
+    /// Key format: `cached_user_{normalizedServerURL}`
     ///
     /// **Security:** User data (email, role) is stored in the Keychain
     /// rather than plaintext UserDefaults to protect PII from unencrypted
     /// device backups.
     func cacheCurrentUser() {
         guard let user = currentUser else { return }
+        let serverKey = serverConfigStore.activeServer?.url ?? Self.cachedUserKey
         do {
             let data = try JSONEncoder().encode(user)
             let dataString = data.base64EncodedString()
-            KeychainService.shared.saveToken(dataString, forServer: "cached_user_\(Self.cachedUserKey)")
-            logger.debug("Cached user '\(user.displayName)' for optimistic auth (Keychain)")
+            KeychainService.shared.saveToken(dataString, forServer: "cached_user_\(serverKey)")
+            // Also update server metadata in the store for the switcher UI
+            serverConfigStore.updateActiveServerMetadata(
+                userName: user.displayName,
+                userEmail: user.email,
+                profileImageURL: user.profileImageURL,
+                authType: nil,
+                hasActiveSession: true
+            )
+            logger.debug("Cached user '\(user.displayName)' for server '\(serverKey)'")
         } catch {
             logger.warning("Failed to cache user: \(error.localizedDescription)")
         }
     }
 
-    /// Loads a previously cached user from Keychain.
-    static func loadCachedUser() -> User? {
-        guard let dataString = KeychainService.shared.getToken(forServer: "cached_user_\(cachedUserKey)"),
-              let data = Data(base64Encoded: dataString) else { return nil }
-        return try? JSONDecoder().decode(User.self, from: data)
+    /// Loads a previously cached user from Keychain for the given server URL.
+    /// Falls back to the legacy global key for backwards compatibility on first update.
+    static func loadCachedUser(forServer serverURL: String? = nil) -> User? {
+        let key = serverURL ?? cachedUserKey
+        // Try per-server key first
+        if let dataString = KeychainService.shared.getToken(forServer: "cached_user_\(key)"),
+           let data = Data(base64Encoded: dataString),
+           let user = try? JSONDecoder().decode(User.self, from: data) {
+            return user
+        }
+        // Legacy fallback: global key (migrates on first successful load)
+        if let dataString = KeychainService.shared.getToken(forServer: "cached_user_\(cachedUserKey)"),
+           let data = Data(base64Encoded: dataString) {
+            return try? JSONDecoder().decode(User.self, from: data)
+        }
+        return nil
     }
 
     /// Clears SSO/OAuth cookies from WKWebsiteDataStore so the next sign-in
@@ -1153,6 +1252,123 @@ final class AuthViewModel {
         // Also clean up legacy UserDefaults entry if present
         UserDefaults.standard.removeObject(forKey: Self.cachedUserKey)
         logger.debug("Cleared cached user")
+    }
+
+    // MARK: - Multi-Server Management
+
+    /// Switches the active server to the given config, tears down existing services,
+    /// and attempts to restore the saved session for the new server.
+    ///
+    /// Flow:
+    /// 1. Save current user metadata to the outgoing server config.
+    /// 2. Stop timers / disconnect socket for the old server.
+    /// 3. Activate the new server in the store.
+    /// 4. Rebuild all dependent services via `dependencies?.configureServicesForActiveServer`.
+    /// 5. Attempt session restore from Keychain for the new server.
+    func switchToServer(_ config: ServerConfig) async {
+        logger.info("🔀 Switching to server: \(config.url)")
+
+        // 1. Persist current user metadata before we tear down
+        if let user = currentUser {
+            serverConfigStore.updateActiveServerMetadata(
+                userName: user.displayName,
+                userEmail: user.email,
+                profileImageURL: user.profileImageURL,
+                authType: nil,
+                hasActiveSession: false   // no longer the active session
+            )
+        }
+
+        stopTokenRefreshTimer()
+        dependencies?.socketService?.disconnect()
+        dependencies?.activeChatStore.clear()
+
+        // Clear SSO cookies so the next server's SSO can't inherit them
+        clearSSOCookies()
+        Task { await ImageCacheService.shared.evictProfileImages() }
+
+        currentUser = nil
+        backendConfig = nil
+        email = ""
+        password = ""
+        ldapUsername = ""
+        ldapPassword = ""
+        errorMessage = nil
+
+        // 2. Activate new server
+        serverConfigStore.setActiveServer(id: config.id)
+        serverURL = config.url
+
+        // Reset navigation
+        dependencies?.router?.resetAll()
+
+        // 3. Rebuild all services for the new server
+        dependencies?.configureServicesForActiveServer(isServerSwitch: true)
+
+        // 4. Try to restore the saved session for this server
+        let hasToken = KeychainService.shared.hasToken(forServer: config.url)
+
+        if hasToken {
+            // Check for a cached user for instant display while validating
+            if let cachedUser = Self.loadCachedUser(forServer: config.url) {
+                currentUser = cachedUser
+                phase = .authenticated
+                // Validate in background — same optimistic-auth pattern as app launch
+                await validateSessionInBackground()
+            } else {
+                phase = .restoringSession
+                await restoreSession()
+            }
+        } else {
+            // No saved token — need to authenticate fresh
+            await ensureBackendConfig()
+            phase = .authMethodSelection
+        }
+
+        logger.info("🔀 Server switch complete — phase=\(String(describing: self.phase))")
+    }
+
+    /// Removes a saved server entirely (from the list, Keychain, and disk).
+    ///
+    /// If the removed server is currently active:
+    /// - Switches to the next available server, or
+    /// - Returns to the server connection screen if no others are saved.
+    func removeServer(id: String) async {
+        let isActive = serverConfigStore.activeServer?.id == id
+        let remainingServers = serverConfigStore.servers.filter { $0.id != id }
+
+        // If removing the active server, we need to switch away first
+        if isActive {
+            stopTokenRefreshTimer()
+            dependencies?.socketService?.disconnect()
+            dependencies?.activeChatStore.clear()
+            clearSSOCookies()
+            currentUser = nil
+            backendConfig = nil
+            errorMessage = nil
+        }
+
+        // Remove from store (also cleans up Keychain)
+        serverConfigStore.removeServer(id: id)
+        logger.info("🗑️ Removed server id=\(id)")
+
+        guard isActive else { return }
+
+        if let nextServer = remainingServers.first {
+            // Switch to the next available server
+            await switchToServer(nextServer)
+        } else {
+            // No more servers — go to the server connection screen
+            dependencies?.refreshServices()
+            serverURL = ""
+            apiKey = ""
+            phase = .serverConnection
+        }
+    }
+
+    /// Accessible list of saved servers for the server switcher UI.
+    var savedServers: [ServerConfig] {
+        serverConfigStore.servers
     }
 
     // MARK: - Background Session Validation (for optimistic auth)

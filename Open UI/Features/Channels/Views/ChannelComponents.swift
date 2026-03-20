@@ -1041,14 +1041,21 @@ struct DmSettingsSheet: View {
                     
                     // "You" row
                     HStack(spacing: Spacing.md) {
-                        Circle()
-                            .fill(theme.brandPrimary.opacity(0.12))
-                            .frame(width: 36, height: 36)
-                            .overlay(
-                                Text("Y")
-                                    .scaledFont(size: 14, weight: .bold)
-                                    .foregroundStyle(theme.brandPrimary)
+                        ZStack(alignment: .bottomTrailing) {
+                            UserAvatar(
+                                size: 36,
+                                imageURL: {
+                                    guard let userId = currentUserId, !userId.isEmpty, !serverBaseURL.isEmpty else { return nil }
+                                    return URL(string: "\(serverBaseURL)/api/v1/users/\(userId)/profile/image")
+                                }(),
+                                name: "You"
                             )
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 10, height: 10)
+                                .overlay(Circle().stroke(theme.background, lineWidth: 1.5))
+                                .offset(x: 2, y: 2)
+                        }
                         Text("You")
                             .scaledFont(size: 15, weight: .medium)
                             .foregroundStyle(theme.textPrimary)

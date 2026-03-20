@@ -32,6 +32,15 @@ final class FolderManager: @unchecked Sendable {
         return (folders, true)
     }
 
+    /// Fetches full folder details by ID, including data and meta fields.
+    func fetchFolderById(id: String) async throws -> ChatFolder {
+        let raw = try await apiClient.getFolderById(id: id)
+        guard let folder = ChatFolder(json: raw) else {
+            throw FolderError.invalidResponse
+        }
+        return folder
+    }
+
     /// Fetches the conversations inside a specific folder (page 1).
     func fetchChatsInFolder(folderId: String) async throws -> [Conversation] {
         try await apiClient.getChatsInFolder(folderId: folderId)
@@ -40,30 +49,58 @@ final class FolderManager: @unchecked Sendable {
     // MARK: - Create
 
     /// Creates a new folder with the given name and returns the persisted model.
-    func createFolder(name: String, parentId: String? = nil) async throws -> ChatFolder {
-        let raw = try await apiClient.createFolder(name: name, parentId: parentId)
+    func createFolder(
+        name: String,
+        parentId: String? = nil,
+        data: FolderData? = nil,
+        meta: FolderMeta? = nil
+    ) async throws -> ChatFolder {
+        let raw = try await apiClient.createFolder(
+            name: name,
+            parentId: parentId,
+            data: data?.toJSON(),
+            meta: meta?.toJSON()
+        )
         guard let folder = ChatFolder(json: raw) else {
             throw FolderError.invalidResponse
         }
         return folder
     }
 
-    // MARK: - Rename
+    // MARK: - Update (Full)
 
-    /// Renames a folder, returning the updated model.
-    func renameFolder(id: String, name: String) async throws -> ChatFolder {
-        let raw = try await apiClient.renameFolder(id: id, name: name)
+    /// Full update: name, data (system prompt, models, knowledge), and meta (background image).
+    func updateFolder(
+        id: String,
+        name: String? = nil,
+        data: FolderData? = nil,
+        meta: FolderMeta? = nil
+    ) async throws -> ChatFolder {
+        let raw = try await apiClient.updateFolder(
+            id: id,
+            name: name,
+            data: data?.toJSON(),
+            meta: meta?.toJSON()
+        )
         guard let folder = ChatFolder(json: raw) else {
             throw FolderError.invalidResponse
         }
         return folder
+    }
+
+    // MARK: - Rename (convenience)
+
+    /// Renames a folder, returning the updated model.
+    func renameFolder(id: String, name: String) async throws -> ChatFolder {
+        return try await updateFolder(id: id, name: name)
     }
 
     // MARK: - Delete
 
     /// Deletes a folder by ID.
-    func deleteFolder(id: String) async throws {
-        try await apiClient.deleteFolder(id: id)
+    /// When `deleteContents` is true, also deletes all chats inside the folder.
+    func deleteFolder(id: String, deleteContents: Bool = false) async throws {
+        try await apiClient.deleteFolder(id: id, deleteContents: deleteContents)
     }
 
     // MARK: - Move Chat
@@ -75,6 +112,13 @@ final class FolderManager: @unchecked Sendable {
             conversationId: conversationId,
             folderId: folderId
         )
+    }
+
+    // MARK: - Move Folder (reparent)
+
+    /// Moves a folder under a new parent (or to root when `parentId` is nil).
+    func moveFolderParent(id: String, parentId: String?) async throws {
+        try await apiClient.moveFolderParent(id: id, parentId: parentId)
     }
 
     // MARK: - Expand / Collapse (debounced)

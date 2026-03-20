@@ -428,6 +428,34 @@ struct SSOWebViewRepresentable: UIViewRepresentable {
             return segments.count == 3 && cleaned.count >= 50
         }
 
+        /// Reads the `token` cookie directly from WKHTTPCookieStore.
+        /// This works for HttpOnly cookies that JavaScript cannot access via `document.cookie`.
+        private func attemptNativeCookieCapture(attemptId: Int) async -> Bool {
+            guard let webView, !state.tokenCaptured, attemptId == captureAttemptId else { return false }
+
+            return await withCheckedContinuation { continuation in
+                webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
+                    // Look for an OpenWebUI token cookie
+                    let tokenCookie = cookies.first { cookie in
+                        cookie.name == "token" &&
+                        (cookie.domain.contains(self.serverURL.components(separatedBy: "://").last?.components(separatedBy: "/").first ?? "") ||
+                         self.serverURL.contains(cookie.domain))
+                    }
+                    guard let cookie = tokenCookie,
+                          !cookie.value.isEmpty,
+                          self.isValidJWT(cookie.value) else {
+                        continuation.resume(returning: false)
+                        return
+                    }
+                    self.logger.info("Found valid token in native WKHTTPCookieStore (HttpOnly cookie)")
+                    Task { @MainActor in
+                        await self.handleToken(cookie.value)
+                    }
+                    continuation.resume(returning: true)
+                }
+            }
+        }
+
         /// Handles a captured SSO token.
         @MainActor
         private func handleToken(_ rawToken: String) async {

@@ -19,6 +19,11 @@ struct AIModel: Codable, Identifiable, Hashable, Sendable {
     /// Values: `"native"` for native tool calling, `nil`/absent for default (server-handled).
     /// Sourced from `info.params.function_calling` in the OpenWebUI model payload.
     var functionCallingMode: String?
+    /// Builtin tools enabled for this model by the admin.
+    /// Keys match OpenWebUI's `meta.builtinTools` object (e.g. `"memory"`, `"time"`,
+    /// `"web_search"`, `"image_generation"`, `"code_interpreter"`, etc.).
+    /// A `true` value means the tool is available; `false` means it's disabled.
+    var builtinTools: [String: Bool]
 
     init(
         id: String,
@@ -32,7 +37,8 @@ struct AIModel: Codable, Identifiable, Hashable, Sendable {
         profileImageURL: String? = nil,
         toolIds: [String] = [],
         defaultFeatureIds: [String] = [],
-        functionCallingMode: String? = nil
+        functionCallingMode: String? = nil,
+        builtinTools: [String: Bool] = [:]
     ) {
         self.id = id
         self.name = name
@@ -46,6 +52,12 @@ struct AIModel: Codable, Identifiable, Hashable, Sendable {
         self.toolIds = toolIds
         self.defaultFeatureIds = defaultFeatureIds
         self.functionCallingMode = functionCallingMode
+        self.builtinTools = builtinTools
+    }
+
+    /// Whether the memory builtin tool is enabled for this model.
+    var supportsMemory: Bool {
+        builtinTools["memory"] == true
     }
 
     /// A short display name, extracting the model name after any provider prefix.

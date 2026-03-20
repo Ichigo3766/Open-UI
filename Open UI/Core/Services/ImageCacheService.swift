@@ -51,6 +51,61 @@ actor ImageCacheService {
         self.cfServerHost = serverHost
     }
 
+    // MARK: - Self-Signed Certificate Support
+
+    /// Whether requests to the configured server host should bypass SSL validation.
+    /// Set by DependencyContainer when `ServerConfig.allowSelfSignedCertificates` is true.
+    private var allowSelfSignedCerts: Bool = false
+
+    /// The server host scoped for self-signed cert bypass.
+    /// Only requests targeting this host skip SSL validation — external URLs still use
+    /// the system trust store so we don't weaken security for unrelated endpoints.
+    private var selfSignedCertServerHost: String?
+
+    /// Lazy custom URLSession that trusts self-signed certificates.
+    /// Created once on first use and reused for all subsequent requests.
+    /// Re-created when `configureSelfSignedCertSupport` is called with new settings.
+    private var selfSignedSession: URLSession?
+
+    /// Configures self-signed certificate support for image requests.
+    /// Called by DependencyContainer when `ServerConfig.allowSelfSignedCertificates` changes.
+    ///
+    /// - Parameters:
+    ///   - allowed: When `true`, image requests to `serverHost` will bypass SSL cert validation.
+    ///   - serverHost: The server host (e.g. `"myserver.local"`) to scope the bypass to.
+    func configureSelfSignedCertSupport(allowed: Bool, serverHost: String?) {
+        self.allowSelfSignedCerts = allowed
+        self.selfSignedCertServerHost = serverHost
+        // Invalidate cached session so it's re-created with new settings on next use
+        selfSignedSession?.invalidateAndCancel()
+        selfSignedSession = nil
+        logger.info("ImageCache: self-signed cert support \(allowed ? "enabled" : "disabled") for host \(serverHost ?? "none")")
+    }
+
+    /// Returns the URLSession to use for a given URL.
+    /// Uses the self-signed-cert session when the URL targets the configured
+    /// server host and `allowSelfSignedCerts` is enabled; otherwise uses `URLSession.shared`.
+    private func session(for url: URL) -> URLSession {
+        guard allowSelfSignedCerts,
+              let targetHost = selfSignedCertServerHost,
+              url.host?.lowercased() == targetHost.lowercased() else {
+            return URLSession.shared
+        }
+
+        if let existing = selfSignedSession {
+            return existing
+        }
+
+        let delegate = SelfSignedCertDelegate(serverHost: targetHost)
+        let config = URLSessionConfiguration.default
+        config.httpCookieStorage = HTTPCookieStorage.shared
+        config.httpCookieAcceptPolicy = .always
+        config.httpShouldSetCookies = true
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+        selfSignedSession = session
+        return session
+    }
+
     // MARK: - Init
 
     private init() {
@@ -133,9 +188,10 @@ actor ImageCacheService {
                     request.setValue(value, forHTTPHeaderField: key)
                 }
 
-                // Use URLSession.shared which picks up cookies from HTTPCookieStorage.shared
-                // (including cf_clearance). The custom User-Agent header ensures CF accepts it.
-                let (data, response) = try await URLSession.shared.data(for: request)
+                // Use the appropriate URLSession:
+                // - Self-signed cert servers: custom session with certificate bypass delegate
+                // - All other servers: URLSession.shared (picks up cf_clearance cookies)
+                let (data, response) = try await self.session(for: url).data(for: request)
 
                 let httpResponse = response as? HTTPURLResponse
                 let statusCode = httpResponse?.statusCode ?? -1
@@ -409,5 +465,36 @@ struct CachedAsyncImage<Content: View, Placeholder: View>: View {
 
         loadedImage = await ImageCacheService.shared.loadImage(from: url, authToken: authToken)
         isLoading = false
+    }
+}
+
+// MARK: - Self-Signed Certificate Delegate
+
+/// `URLSessionDelegate` that accepts self-signed TLS certificates for a specific server host.
+///
+/// Scoped to the configured host only — external URLs (e.g. Gravatar, CDN avatars) still
+/// go through the system trust store so we don't weaken security globally.
+///
+/// Mirrors the `CertificateTrustDelegate` used by `NetworkManager` for API requests.
+private final class SelfSignedCertDelegate: NSObject, URLSessionDelegate, Sendable {
+    let serverHost: String
+
+    init(serverHost: String) {
+        self.serverHost = serverHost
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        // Only bypass SSL for the configured server host
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              challenge.protectionSpace.host.lowercased() == serverHost.lowercased(),
+              let serverTrust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: serverTrust))
     }
 }

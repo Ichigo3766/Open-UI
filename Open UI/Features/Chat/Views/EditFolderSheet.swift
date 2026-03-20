@@ -1,60 +1,54 @@
 import SwiftUI
 import PhotosUI
 
-/// Sheet for creating a new folder — shows full settings matching the web UI:
-/// name, background image, system prompt, and knowledge.
+/// Full-featured folder settings sheet, matching the web UI "Edit Folder" modal.
 ///
-/// On save, calls `onCreate` with the name plus optional data/meta.
-struct CreateFolderSheet: View {
+/// Loads knowledge items (collections + files + folders) directly from the
+/// APIClient so you always see the full, fresh list. No dependency on ChatViewModel.
+struct EditFolderSheet: View {
     // MARK: - Inputs
 
+    let folder: ChatFolder
     let apiClient: APIClient?
-    var onCreate: (String, FolderData?, FolderMeta?) -> Void
+    var onSave: (String, FolderData?, FolderMeta?) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.theme) private var theme
 
     // MARK: - State
 
-    @State private var folderName = ""
-    @State private var systemPrompt = ""
-    @State private var attachedKnowledge: [FolderKnowledgeItem] = []
+    @State private var folderName: String
+    @State private var systemPrompt: String
+    @State private var attachedKnowledge: [FolderKnowledgeItem]
     @State private var backgroundImageUrl: String?
 
+    // Knowledge loading
     @State private var allKnowledgeItems: [KnowledgeItem] = []
     @State private var isLoadingKnowledge = false
 
+    // PhotosPicker
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var isUploadingImage = false
 
     @State private var showKnowledgePicker = false
-    @FocusState private var nameFocused: Bool
     @FocusState private var promptFocused: Bool
+    @FocusState private var nameFocused: Bool
 
-    // MARK: - Rename-Only Init (backward compat for inline rename flows)
-
-    /// Lightweight rename-only variant — shows just a name field (no full settings).
-    /// Used by ChatListView and other places that only need to rename an existing folder.
-    init(existingName: String, onRename: @escaping (String) -> Void) {
-        self.apiClient = nil
-        self.onCreate = { name, _, _ in onRename(name) }
-        _folderName = State(initialValue: existingName)
-    }
-
-    // MARK: - Full Create Init
+    // MARK: - Init
 
     init(
+        folder: ChatFolder,
         apiClient: APIClient? = nil,
-        onCreate: @escaping (String, FolderData?, FolderMeta?) -> Void
+        onSave: @escaping (String, FolderData?, FolderMeta?) -> Void
     ) {
+        self.folder = folder
         self.apiClient = apiClient
-        self.onCreate = onCreate
-    }
+        self.onSave = onSave
 
-    // MARK: - Computed
-
-    private var isActionEnabled: Bool {
-        !folderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        _folderName = State(initialValue: folder.name)
+        _systemPrompt = State(initialValue: folder.data?.systemPrompt ?? "")
+        _attachedKnowledge = State(initialValue: folder.data?.knowledgeItems ?? [])
+        _backgroundImageUrl = State(initialValue: folder.meta?.backgroundImageUrl)
     }
 
     // MARK: - Body
@@ -63,47 +57,37 @@ struct CreateFolderSheet: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: Spacing.xl) {
-                    // Folder name
                     nameSection
 
                     Divider().padding(.horizontal, Spacing.md)
 
-                    // Background image
                     backgroundSection
 
                     Divider().padding(.horizontal, Spacing.md)
 
-                    // System prompt
                     systemPromptSection
 
                     Divider().padding(.horizontal, Spacing.md)
 
-                    // Knowledge
                     knowledgeSection
 
                     Spacer(minLength: Spacing.xl)
                 }
                 .padding(.top, Spacing.md)
             }
-            .navigationTitle(String(localized: "Create Folder"))
+            .navigationTitle(String(localized: "Edit Folder"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(String(localized: "Cancel")) { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(String(localized: "Save")) { commitCreate() }
+                    Button(String(localized: "Save")) { save() }
                         .fontWeight(.semibold)
-                        .disabled(!isActionEnabled)
                 }
             }
             .background(theme.background)
             .task { await loadKnowledge() }
-            .onAppear {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                    nameFocused = true
-                }
-            }
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
@@ -132,7 +116,6 @@ struct CreateFolderSheet: View {
                 .submitLabel(.done)
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.words)
-                .onSubmit { if isActionEnabled { commitCreate() } }
         }
     }
 
@@ -147,7 +130,8 @@ struct CreateFolderSheet: View {
                     photoLibrary: .shared()
                 ) {
                     if isUploadingImage {
-                        ProgressView().controlSize(.small).padding(.trailing, Spacing.md)
+                        ProgressView().controlSize(.small)
+                            .padding(.trailing, Spacing.md)
                     } else {
                         Text("Upload")
                             .scaledFont(size: 14, weight: .medium)
@@ -202,7 +186,7 @@ struct CreateFolderSheet: View {
                 TextEditor(text: $systemPrompt)
                     .focused($promptFocused)
                     .scaledFont(size: 15)
-                    .frame(minHeight: 120, maxHeight: 200)
+                    .frame(minHeight: 120, maxHeight: 220)
                     .padding(Spacing.sm)
                     .background(theme.inputBackground, in: RoundedRectangle(cornerRadius: 12))
                     .overlay(
@@ -264,9 +248,11 @@ struct CreateFolderSheet: View {
                         if isLoadingKnowledge {
                             ProgressView().controlSize(.small)
                         } else {
-                            Image(systemName: "book.closed").scaledFont(size: 14)
+                            Image(systemName: "book.closed")
+                                .scaledFont(size: 14)
                         }
-                        Text("Select Knowledge").scaledFont(size: 14, weight: .medium)
+                        Text("Select Knowledge")
+                            .scaledFont(size: 14, weight: .medium)
                     }
                     .padding(.horizontal, Spacing.md)
                     .padding(.vertical, Spacing.sm)
@@ -321,13 +307,17 @@ struct CreateFolderSheet: View {
 
     // MARK: - Knowledge Loading
 
+    /// Loads all knowledge sources from the server: collections + files + (folder items as a subset).
     private func loadKnowledge() async {
         guard let api = apiClient else { return }
         isLoadingKnowledge = true
         do {
+            // Fetch collections, knowledge files, and chat folders in parallel
             async let collectionsReq = api.getKnowledgeItems()
             async let filesReq = (try? await api.getKnowledgeFileItems()) ?? []
+
             let (collections, files) = try await (collectionsReq, filesReq)
+            // Combine: collections + files (both appear in the # picker)
             allKnowledgeItems = collections + files
         } catch {
             allKnowledgeItems = []
@@ -344,16 +334,18 @@ struct CreateFolderSheet: View {
             .padding(.horizontal, Spacing.md)
     }
 
-    private func commitCreate() {
+    private func save() {
         let name = folderName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
-
         let prompt = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let data: FolderData? = {
-            if prompt.isEmpty && attachedKnowledge.isEmpty { return nil }
+            // Preserve existing modelIds; update prompt and knowledge
+            let existingModelIds = folder.data?.modelIds ?? []
+            if prompt.isEmpty && attachedKnowledge.isEmpty && existingModelIds.isEmpty {
+                return nil
+            }
             return FolderData(
-                modelIds: [],
+                modelIds: existingModelIds,
                 systemPrompt: prompt.isEmpty ? nil : prompt,
                 knowledgeItems: attachedKnowledge
             )
@@ -367,7 +359,7 @@ struct CreateFolderSheet: View {
         }()
 
         dismiss()
-        onCreate(name, data, meta)
+        onSave(name.isEmpty ? folder.name : name, data, meta)
     }
 
     private func iconName(for type: String) -> String {

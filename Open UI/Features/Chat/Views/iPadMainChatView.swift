@@ -1201,9 +1201,15 @@ private extension View {
                 if !isPresented { router.voiceCallViewModel = nil }
             }
             .sheet(isPresented: showCreateFolderSheet) {
-                CreateFolderSheet(onCreate: { name in
-                    Task { await listViewModel.folderViewModel.createFolder(name: name) }
-                })
+                CreateFolderSheet(apiClient: dependencies.apiClient) { name, data, meta in
+                    let parentId = listViewModel.folderViewModel.createSubfolderParentId
+                    listViewModel.folderViewModel.createSubfolderParentId = nil
+                    Task {
+                        await listViewModel.folderViewModel.createFolder(
+                            name: name, parentId: parentId, data: data, meta: meta
+                        )
+                    }
+                }
             }
             .alert("Rename Folder", isPresented: .init(
                 get: { listViewModel.folderViewModel.renamingFolder != nil },

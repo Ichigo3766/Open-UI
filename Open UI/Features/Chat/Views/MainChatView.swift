@@ -56,6 +56,11 @@ struct MainChatView: View {
     /// Whether the "create folder" sheet is visible.
     @State private var showCreateFolderSheet = false
 
+    /// When set, the main content area shows a folder workspace view
+    /// (folder icon + name centered, chat input below). Any new chat
+    /// started will be assigned to this folder with its system prompt.
+    @State private var activeFolderWorkspaceId: String?
+
     /// Tracks whether socket reconnect handler has been registered.
     @State private var hasRegisteredSocketHandlers = false
 
@@ -80,6 +85,9 @@ struct MainChatView: View {
     /// Rename conversation state.
     @State private var renamingConversation: Conversation?
     @State private var renameText = ""
+
+    /// Share sheet state.
+    @State private var sharingConversation: Conversation?
 
     /// Export file URL for share sheet.
     @State private var exportFileURL: URL?
@@ -192,21 +200,25 @@ struct MainChatView: View {
                         }
 
                         ToolbarItem(placement: .principal) {
-                            modelSelector
+                            if activeChannelId == nil {
+                                modelSelector
+                            }
                         }
 
                         ToolbarItem(placement: .topBarTrailing) {
-                            Button {
-                                startNewChat()
-                            } label: {
-                                Image(systemName: "square.and.pencil")
-                                    .scaledFont(size: 14, weight: .medium)
-                                    .foregroundStyle(theme.textSecondary)
-                                    .frame(width: 34, height: 34)
-                                    .contentShape(Rectangle())
+                            if activeChannelId == nil {
+                                Button {
+                                    startNewChat()
+                                } label: {
+                                    Image(systemName: "square.and.pencil")
+                                        .scaledFont(size: 14, weight: .medium)
+                                        .foregroundStyle(theme.textSecondary)
+                                        .frame(width: 34, height: 34)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("New Chat")
                             }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("New Chat")
                         }
                     }
             }
@@ -486,10 +498,46 @@ struct MainChatView: View {
                     allUsers: channelListVM.allServerUsers
                 )
             }
+            // Create folder — shows full settings sheet (name + system prompt + knowledge)
             .sheet(isPresented: $showCreateFolderSheet) {
-                CreateFolderSheet(onCreate: { name in
-                    Task { await listViewModel.folderViewModel.createFolder(name: name) }
-                })
+                CreateFolderSheet(apiClient: dependencies.apiClient) { name, data, meta in
+                    let parentId = listViewModel.folderViewModel.createSubfolderParentId
+                    listViewModel.folderViewModel.createSubfolderParentId = nil
+                    Task {
+                        await listViewModel.folderViewModel.createFolder(
+                            name: name,
+                            parentId: parentId,
+                            data: data,
+                            meta: meta
+                        )
+                    }
+                }
+            }
+            // Create folder from folderVM.showCreateSheet (triggered by context menu "Create Folder")
+            .onChange(of: listViewModel.folderViewModel.showCreateSheet) { _, show in
+                if show {
+                    listViewModel.folderViewModel.showCreateSheet = false
+                    showCreateFolderSheet = true
+                }
+            }
+            // Edit folder sheet — passes apiClient so it can load knowledge independently
+            .sheet(item: Binding(
+                get: { listViewModel.folderViewModel.editingFolder },
+                set: { listViewModel.folderViewModel.editingFolder = $0 }
+            )) { folder in
+                EditFolderSheet(
+                    folder: folder,
+                    apiClient: dependencies.apiClient
+                ) { name, data, meta in
+                    Task {
+                        await listViewModel.folderViewModel.updateFolderSettings(
+                            id: folder.id,
+                            name: name,
+                            data: data,
+                            meta: meta
+                        )
+                    }
+                }
             }
             .alert(
                 "Rename Folder",
@@ -520,6 +568,25 @@ struct MainChatView: View {
             }) {
                 if let url = exportFileURL {
                     ShareSheet(items: [url])
+                }
+            }
+            // Share chat sheet
+            .sheet(item: $sharingConversation) { conversation in
+                if let apiClient = dependencies.apiClient {
+                    ShareChatSheet(
+                        conversation: conversation,
+                        apiClient: apiClient,
+                        serverBaseURL: apiClient.baseURL,
+                        onShareIdUpdated: { shareId in
+                            listViewModel.updateShareId(for: conversation.id, shareId: shareId)
+                        },
+                        onClone: { cloned in
+                            activeConversationId = cloned.id
+                            SharedDataService.shared.saveLastActiveConversationId(cloned.id)
+                            closeDrawer()
+                        }
+                    )
+                    .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
                 }
             }
     }
@@ -864,6 +931,7 @@ struct MainChatView: View {
 
         activeConversationId = nil
         activeChannelId = nil
+        activeFolderWorkspaceId = nil
         // Reset terminal file browser state so it starts fresh in the new chat
         closeFileBrowserAnimated()
         terminalBrowserVM.reset()
@@ -886,6 +954,31 @@ struct MainChatView: View {
             )
             .id(conversationId)
             .transition(.opacity)
+        } else if let folderWorkspaceId = activeFolderWorkspaceId {
+            // Folder workspace: new chat screen locked to this folder.
+            // The ChatViewModel receives folder context so when the user
+            // sends a message the chat is created inside this folder.
+            let vm = dependencies.activeChatStore.viewModel(for: nil)
+            let folder = listViewModel.folderViewModel.folders.first { $0.id == folderWorkspaceId }
+                ?? listViewModel.folderViewModel.activeFolderDetail
+            ChatDetailView(
+                viewModel: vm,
+                folderWorkspace: folder
+            )
+            .id("folder-workspace-\(folderWorkspaceId)-\(newChatGeneration)")
+            .transition(.opacity)
+            .onAppear {
+                // Set folder context on the VM so new chats are created in this folder
+                let folderDetail = listViewModel.folderViewModel.activeFolderDetail
+                vm.setFolderContext(
+                    folderId: folderWorkspaceId,
+                    systemPrompt: folderDetail?.systemPrompt
+                        ?? folder?.systemPrompt,
+                    modelIds: folderDetail?.modelIds
+                        ?? folder?.modelIds
+                        ?? []
+                )
+            }
         } else {
             ChatDetailView(
                 viewModel: dependencies.activeChatStore.viewModel(for: nil)
@@ -1014,8 +1107,22 @@ struct MainChatView: View {
                                             : Color.clear
                                     )
                                     .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm))
+                                    .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
+                                .contextMenu {
+                                    Button(role: .destructive) {
+                                        Task {
+                                            if activeChannelId == channel.id {
+                                                activeChannelId = nil
+                                            }
+                                            try? await dependencies.apiClient?.deleteChannel(id: channel.id)
+                                            await channelListVM.refreshChannels()
+                                        }
+                                    } label: {
+                                        Label("Delete Channel", systemImage: "trash")
+                                    }
+                                }
                             }
                         }
                     }
@@ -1324,16 +1431,32 @@ struct MainChatView: View {
             .padding(.horizontal, Spacing.md)
             .padding(.vertical, Spacing.sm)
 
-            // Folder rows
-            ForEach(folderVM.folders) { folder in
+            // Folder rows — use rootFolders (tree with childFolders populated)
+            ForEach(folderVM.rootFolders) { folder in
                 DrawerFolderRow(
                     folder: folder,
                     folderVM: folderVM,
                     allConversations: listViewModel.conversations,
                     activeConversationId: activeConversationId,
+                    activeFolderWorkspaceId: activeFolderWorkspaceId,
                     onSelectChat: { chatId in
                         activeConversationId = chatId
+                        activeFolderWorkspaceId = nil
                         SharedDataService.shared.saveLastActiveConversationId(chatId)
+                        closeDrawer()
+                    },
+                    onSelectFolder: { folderId in
+                        Task { await folderVM.setActiveFolder(folderId) }
+                        // Reset the new-chat VM so the folder workspace always starts fresh.
+                        // Also increments newChatGeneration so the .id() on the folder-workspace
+                        // view changes — this forces onAppear to fire even when switching between
+                        // two different folders, ensuring setFolderContext is called with the
+                        // correct (sub)folder ID.
+                        dependencies.activeChatStore.remove(nil)
+                        newChatGeneration += 1
+                        activeFolderWorkspaceId = folderId
+                        activeConversationId = nil
+                        activeChannelId = nil
                         closeDrawer()
                     },
                     onChatMoved: { chatId, targetFolderId in
@@ -1353,8 +1476,10 @@ struct MainChatView: View {
                     onDeleteChat: { chatId in
                         Task {
                             await listViewModel.deleteConversation(id: chatId)
-                            // Also remove from the folder's local chat list
-                            if let fIdx = folderVM.folders.firstIndex(where: { $0.id == folder.id }) {
+                            // Remove from whichever folder (root or subfolder) contains this chat.
+                            // Using `folder.id` here would only clear the root folder's list,
+                            // leaving subfolder chat lists stale until the drawer is reopened.
+                            for fIdx in folderVM.folders.indices {
                                 folderVM.folders[fIdx].chats.removeAll { $0.id == chatId }
                             }
                             if activeConversationId == chatId {
@@ -1410,6 +1535,7 @@ struct MainChatView: View {
                             : Color.clear
                     )
                     .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             } else {
@@ -1439,6 +1565,7 @@ struct MainChatView: View {
                             : Color.clear
                     )
                     .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 // Make draggable into a folder
@@ -1459,7 +1586,7 @@ struct MainChatView: View {
                 .contextMenu {
                     // Share
                     Button {
-                        Task { _ = await listViewModel.shareConversation(conversation) }
+                        sharingConversation = conversation
                     } label: {
                         Label("Share", systemImage: "square.and.arrow.up")
                     }
@@ -1643,6 +1770,18 @@ struct MainChatView: View {
             .buttonStyle(.plain)
 
             Spacer()
+
+            // New Chat
+            Button {
+                closeDrawer()
+                startNewChat()
+            } label: {
+                Image(systemName: "square.and.pencil")
+                    .scaledFont(size: 16, weight: .medium)
+                    .foregroundStyle(theme.textTertiary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
 
             // Notes
             Button {

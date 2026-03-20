@@ -108,9 +108,22 @@ struct FolderRow: View {
         // Context menu on long press
         .contextMenu {
             Button {
+                Task { await folderVM.beginEdit(folder: folder) }
+            } label: {
+                Label(String(localized: "Edit"), systemImage: "pencil")
+            }
+
+            Button {
+                folderVM.createSubfolderParentId = folder.id
+                folderVM.showCreateSheet = true
+            } label: {
+                Label(String(localized: "Create Folder"), systemImage: "folder.badge.plus")
+            }
+
+            Button {
                 folderVM.beginRename(folder: folder)
             } label: {
-                Label(String(localized: "Rename"), systemImage: "pencil")
+                Label(String(localized: "Rename"), systemImage: "character.cursor.ibeam")
             }
 
             Button(role: .destructive) {
@@ -127,18 +140,21 @@ struct FolderRow: View {
                 Label(String(localized: "Delete"), systemImage: "trash")
             }
         }
-        // Delete confirmation
+        // Delete confirmation — offer "folder only" vs "folder + chats"
         .confirmationDialog(
             String(localized: "Delete \"\(folder.name)\"?"),
             isPresented: $showDeleteConfirmation,
             titleVisibility: .visible
         ) {
-            Button(String(localized: "Delete Folder"), role: .destructive) {
-                Task { await folderVM.deleteFolder(id: folder.id) }
+            Button(String(localized: "Delete Folder Only"), role: .destructive) {
+                Task { await folderVM.deleteFolder(id: folder.id, deleteContents: false) }
+            }
+            Button(String(localized: "Delete Folder and Chats"), role: .destructive) {
+                Task { await folderVM.deleteFolder(id: folder.id, deleteContents: true) }
             }
             Button(String(localized: "Cancel"), role: .cancel) {}
         } message: {
-            Text("Chats inside this folder will not be deleted.")
+            Text("Choose whether to keep the chats or delete them along with the folder.")
         }
         .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16))
         .listRowSeparator(.hidden)

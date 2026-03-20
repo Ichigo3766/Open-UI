@@ -144,10 +144,23 @@ struct SettingsView: View {
                             icon: "server.rack",
                             title: "Server Configuration",
                             subtitle: viewModel.serverURL,
-                            showDivider: false,
+                            showDivider: true,
                             accessory: .chevron
                         ) {
                             navigationPath.append(SettingsDestination.serverManagement)
+                        }
+
+                        SettingsCell(
+                            icon: "arrow.left.arrow.right.circle",
+                            title: "Manage Servers",
+                            subtitle: viewModel.savedServers.count == 1
+                                ? "1 server saved"
+                                : "\(viewModel.savedServers.count) servers saved",
+                            iconColor: .teal,
+                            showDivider: false,
+                            accessory: .chevron
+                        ) {
+                            navigationPath.append(SettingsDestination.serverSwitcher)
                         }
                     }
 
@@ -222,6 +235,13 @@ struct SettingsView: View {
                     AccessibilitySettingsView(manager: dependencies.accessibilityManager)
                 case .serverManagement:
                     ServerManagementView(viewModel: viewModel)
+                case .serverSwitcher:
+                    ScrollView {
+                        SavedServersView(viewModel: viewModel, showAddServerButton: true)
+                    }
+                    .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
+                    .navigationTitle("Manage Servers")
+                    .navigationBarTitleDisplayMode(.large)
                 case .privacySecurity:
                     PrivacySecurityView()
                 case .about:
@@ -332,6 +352,7 @@ enum SettingsDestination: Hashable {
     case appearance
     case accessibility
     case serverManagement
+    case serverSwitcher
     case privacySecurity
     case about
     case chatSettings

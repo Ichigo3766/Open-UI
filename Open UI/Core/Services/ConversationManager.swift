@@ -16,6 +16,12 @@ final class ConversationManager: @unchecked Sendable {
         try await apiClient.getConversations(limit: limit, skip: skip)
     }
 
+    /// Fetches a single page of conversations by 1-based page number.
+    /// Returns an empty array when no more pages exist.
+    func fetchConversationsPage(page: Int, pinnedIds: Set<String>? = nil) async throws -> [Conversation] {
+        try await apiClient.getConversationsPage(page: page, pinnedIds: pinnedIds)
+    }
+
     func fetchConversation(id: String) async throws -> Conversation {
         try await apiClient.getConversation(id: id)
     }

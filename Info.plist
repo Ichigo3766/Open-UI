@@ -5,10 +5,6 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.openui.streaming</string>
-		<!-- BGContinuedProcessingTask for on-device ASR (iOS 26+).
-		     Allows Parakeet/MLX transcription to run for minutes in the background
-		     without the 30-second limit, including GPU access via the
-		     Background GPU Access entitlement. -->
 		<string>com.openui.asr.transcription</string>
 	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>

@@ -42,23 +42,66 @@ final class APIClient: @unchecked Sendable {
         }
     }
 
+    /// Checks server health with proxy detection. Also detects HTTP→HTTPS redirects
+    /// and returns the final HTTPS URL so the caller can update the stored server URL.
     func checkHealthWithProxyDetection() async -> HealthCheckResult {
+        await checkHealthWithProxyDetectionAndFinalURL().result
+    }
+
+    /// Extended health check that also returns the final (post-redirect) URL.
+    /// Used during connect() to detect HTTP→HTTPS upgrades from a load balancer.
+    func checkHealthWithProxyDetectionAndFinalURL() async -> (result: HealthCheckResult, finalURL: String?) {
         do {
+            // Use a custom delegate to capture the final URL after redirects
+            let redirectCapture = RedirectCapturingDelegate(
+                allowSelfSigned: network.serverConfig.allowSelfSignedCertificates,
+                serverConfig: network.serverConfig
+            )
+            let config = URLSessionConfiguration.default
+            config.timeoutIntervalForRequest = 15
+            config.urlCache = nil
+            config.requestCachePolicy = .reloadIgnoringLocalCacheData
+            config.httpCookieStorage = HTTPCookieStorage.shared
+            config.httpCookieAcceptPolicy = .always
+            config.httpShouldSetCookies = true
+            let session = URLSession(configuration: config, delegate: redirectCapture, delegateQueue: nil)
+
             let request = try network.buildRequest(
                 path: "/health",
                 authenticated: false,
                 timeout: 15
             )
-            let (healthData, response) = try await network.session.data(for: request)
+            let (healthData, response) = try await session.data(for: request)
 
             guard let httpResponse = response as? HTTPURLResponse else {
-                return .unreachable
+                return (.unreachable, nil)
+            }
+
+            // Check if a redirect happened (HTTP→HTTPS upgrade)
+            let finalURL = redirectCapture.finalURL.flatMap { url -> String? in
+                guard let originalURL = URL(string: network.serverConfig.url),
+                      url.host?.lowercased() == originalURL.host?.lowercased(),
+                      url.scheme?.lowercased() != originalURL.scheme?.lowercased() else {
+                    return nil
+                }
+                // Rebuild with the new scheme (https) but same host/path/port
+                var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+                components?.path = ""
+                components?.query = nil
+                components?.fragment = nil
+                return components.flatMap { c -> String? in
+                    // Just return scheme + host (+ port if non-standard)
+                    if let port = c.port, (c.scheme == "https" && port != 443) || (c.scheme == "http" && port != 80) {
+                        return "\(c.scheme ?? "https")://\(c.host ?? ""):\(port)"
+                    }
+                    return "\(c.scheme ?? "https")://\(c.host ?? "")"
+                }
             }
 
             let statusCode = httpResponse.statusCode
 
             if [302, 307, 308].contains(statusCode) {
-                return .proxyAuthRequired
+                return (.proxyAuthRequired, nil)
             }
 
             if [401, 403].contains(statusCode) {
@@ -66,9 +109,9 @@ final class APIClient: @unchecked Sendable {
                 if contentType.contains("text/html") {
                     // Could be a Cloudflare challenge — check before flagging as proxy
                     if isCloudflareChallenge(data: healthData, response: httpResponse) {
-                        return .cloudflareChallenge
+                        return (.cloudflareChallenge, nil)
                     }
-                    return .proxyAuthRequired
+                    return (.proxyAuthRequired, nil)
                 }
             }
 
@@ -77,25 +120,26 @@ final class APIClient: @unchecked Sendable {
                 if contentType.contains("text/html") {
                     // Check if this is a Cloudflare JS/bot challenge page
                     if isCloudflareChallenge(data: healthData, response: httpResponse) {
-                        return .cloudflareChallenge
+                        return (.cloudflareChallenge, nil)
                     }
                     // Other HTML from CDN/WAF — probe /api/config to confirm
-                    return await confirmServerReachableViaConfig()
+                    let configResult = await confirmServerReachableViaConfig()
+                    return (configResult, finalURL)
                 }
-                return .healthy
+                return (.healthy, finalURL)
             }
 
             // 407 Proxy Authentication Required
             if statusCode == 407 {
-                return .proxyAuthRequired
+                return (.proxyAuthRequired, nil)
             }
 
-            return .unhealthy
+            return (.unhealthy, nil)
         } catch {
             let apiError = APIError.from(error)
-            if case .sslError = apiError { return .unreachable }
-            if case .networkError = apiError { return .unreachable }
-            return .unreachable
+            if case .sslError = apiError { return (.unreachable, nil) }
+            if case .networkError = apiError { return (.unreachable, nil) }
+            return (.unreachable, nil)
         }
     }
 
@@ -380,12 +424,27 @@ final class APIClient: @unchecked Sendable {
         var toolIds: [String] = []
         var defaultFeatureIds: [String] = []
         var functionCallingMode: String?
+        var builtinTools: [String: Bool] = [:]
 
         // Top-level `params` (present in single-model endpoint)
         if let params = raw["params"] as? [String: Any] {
             if let fc = params["function_calling"] as? String, !fc.isEmpty {
                 functionCallingMode = fc
             }
+        }
+
+        // Helper to parse builtinTools from a meta dict
+        let parseBuiltinTools: ([String: Any]) -> [String: Bool] = { meta in
+            guard let bt = meta["builtinTools"] as? [String: Any] else { return [:] }
+            var result: [String: Bool] = [:]
+            for (key, value) in bt {
+                if let boolVal = value as? Bool {
+                    result[key] = boolVal
+                } else if let intVal = value as? Int {
+                    result[key] = intVal != 0
+                }
+            }
+            return result
         }
 
         // Top-level `meta` (present in single-model endpoint)
@@ -402,6 +461,7 @@ final class APIClient: @unchecked Sendable {
             if let defaultFeatures = meta["defaultFeatureIds"] as? [String] {
                 defaultFeatureIds = defaultFeatures
             }
+            builtinTools = parseBuiltinTools(meta)
         }
 
         // Fallback: `info.meta` (present in list endpoint — allows reuse for both)
@@ -421,6 +481,9 @@ final class APIClient: @unchecked Sendable {
                 if defaultFeatureIds.isEmpty, let defaultFeatures = meta["defaultFeatureIds"] as? [String] {
                     defaultFeatureIds = defaultFeatures
                 }
+                if builtinTools.isEmpty {
+                    builtinTools = parseBuiltinTools(meta)
+                }
             }
         }
 
@@ -436,7 +499,8 @@ final class APIClient: @unchecked Sendable {
             profileImageURL: profileImageURL,
             toolIds: toolIds,
             defaultFeatureIds: defaultFeatureIds,
-            functionCallingMode: functionCallingMode
+            functionCallingMode: functionCallingMode,
+            builtinTools: builtinTools
         )
     }
 
@@ -480,6 +544,40 @@ final class APIClient: @unchecked Sendable {
 
         return array.compactMap { parseConversationSummary($0) }.map { conv in
             guard !pinnedIds.isEmpty, pinnedIds.contains(conv.id) else { return conv }
+            var pinned = conv
+            pinned.pinned = true
+            return pinned
+        }
+    }
+
+    /// Fetches a specific page of conversations.
+    ///
+    /// - Parameter page: 1-based page number.
+    /// - Parameter pinnedIds: Pre-fetched set of pinned IDs to merge in. Pass `nil` to
+    ///   skip pinned merging (used for pages > 1 where pinned IDs are already known).
+    /// - Returns: Array of conversations on this page, or empty array if no more pages.
+    func getConversationsPage(page: Int, pinnedIds: Set<String>? = nil) async throws -> [Conversation] {
+        let queryItems: [URLQueryItem] = [
+            URLQueryItem(name: "page", value: "\(max(1, page))"),
+            URLQueryItem(name: "include_folders", value: "false"),
+            URLQueryItem(name: "include_pinned", value: "true")
+        ]
+
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/chats/",
+            queryItems: queryItems
+        )
+
+        guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            // Some servers return null or a non-array — treat as end of pages
+            return []
+        }
+
+        guard !array.isEmpty else { return [] }
+
+        let knownPinnedIds = pinnedIds ?? Set<String>()
+        return array.compactMap { parseConversationSummary($0) }.map { conv in
+            guard !knownPinnedIds.isEmpty, knownPinnedIds.contains(conv.id) else { return conv }
             var pinned = conv
             pinned.pinned = true
             return pinned
@@ -788,9 +886,16 @@ final class APIClient: @unchecked Sendable {
         }
     }
 
-    func createFolder(name: String, parentId: String? = nil) async throws -> [String: Any] {
+    func createFolder(
+        name: String,
+        parentId: String? = nil,
+        data folderData: [String: Any]? = nil,
+        meta: [String: Any]? = nil
+    ) async throws -> [String: Any] {
         var body: [String: Any] = ["name": name]
         if let parentId { body["parent_id"] = parentId }
+        if let folderData { body["data"] = folderData }
+        if let meta { body["meta"] = meta }
         return try await network.requestJSON(
             path: "/api/v1/folders/",
             method: .post,
@@ -798,12 +903,33 @@ final class APIClient: @unchecked Sendable {
         )
     }
 
-    func renameFolder(id: String, name: String) async throws -> [String: Any] {
+    /// Fetches full folder details by ID, including `data` and `meta` fields.
+    func getFolderById(id: String) async throws -> [String: Any] {
+        return try await network.requestJSON(path: "/api/v1/folders/\(id)")
+    }
+
+    /// Full update: name, data (system prompt, models, knowledge), and meta (background image).
+    /// Uses `FolderUpdateForm` schema: name?, data?, meta?.
+    func updateFolder(
+        id: String,
+        name: String? = nil,
+        data folderData: [String: Any]? = nil,
+        meta: [String: Any]? = nil
+    ) async throws -> [String: Any] {
+        var body: [String: Any] = [:]
+        if let name { body["name"] = name }
+        if let folderData { body["data"] = folderData }
+        if let meta { body["meta"] = meta }
         return try await network.requestJSON(
             path: "/api/v1/folders/\(id)/update",
             method: .post,
-            body: ["name": name]
+            body: body
         )
+    }
+
+    /// Convenience: rename only (delegates to updateFolder).
+    func renameFolder(id: String, name: String) async throws -> [String: Any] {
+        return try await updateFolder(id: id, name: name)
     }
 
     /// Fire-and-forget — failures are silently ignored.
@@ -829,8 +955,17 @@ final class APIClient: @unchecked Sendable {
         )
     }
 
-    func deleteFolder(id: String) async throws {
-        try await network.requestVoid(path: "/api/v1/folders/\(id)", method: .delete)
+    /// Deletes a folder. When `deleteContents` is true, also deletes all chats inside.
+    func deleteFolder(id: String, deleteContents: Bool = false) async throws {
+        if deleteContents {
+            try await network.requestVoid(
+                path: "/api/v1/folders/\(id)",
+                method: .delete,
+                queryItems: [URLQueryItem(name: "delete_contents", value: "true")]
+            )
+        } else {
+            try await network.requestVoid(path: "/api/v1/folders/\(id)", method: .delete)
+        }
     }
 
     func getChatsInFolder(folderId: String, page: Int = 1) async throws -> [Conversation] {
@@ -1503,6 +1638,22 @@ final class APIClient: @unchecked Sendable {
         )
     }
 
+    /// Fetches a shared chat by its share ID.
+    /// Used to display the read-only shared chat view in-app.
+    func getSharedConversation(shareId: String) async throws -> Conversation {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/chats/share/\(shareId)")
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw APIError.responseDecoding(
+                underlying: NSError(
+                    domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Expected shared chat object"]
+                ),
+                data: data
+            )
+        }
+        return parseFullConversation(json)
+    }
+
     func archiveAllConversations() async throws {
         try await network.requestVoid(
             path: "/api/v1/chats/archive/all",
@@ -1552,8 +1703,8 @@ final class APIClient: @unchecked Sendable {
 
     func resetMemories() async throws {
         try await network.requestVoid(
-            path: "/api/v1/memories/reset",
-            method: .post
+            path: "/api/v1/memories/delete/user",
+            method: .delete
         )
     }
 
@@ -1757,6 +1908,7 @@ final class APIClient: @unchecked Sendable {
             var toolIds: [String] = []
             var defaultFeatureIds: [String] = []
             var functionCallingMode: String?
+            var builtinTools: [String: Bool] = [:]
 
             if let info = raw["info"] as? [String: Any] {
                 if let meta = info["meta"] as? [String: Any] {
@@ -1771,6 +1923,16 @@ final class APIClient: @unchecked Sendable {
                     }
                     if let defaultFeatures = meta["defaultFeatureIds"] as? [String] {
                         defaultFeatureIds = defaultFeatures
+                    }
+                    // Parse builtinTools — e.g. {"memory":true,"time":true,"web_search":true}
+                    if let bt = meta["builtinTools"] as? [String: Any] {
+                        for (key, value) in bt {
+                            if let boolVal = value as? Bool {
+                                builtinTools[key] = boolVal
+                            } else if let intVal = value as? Int {
+                                builtinTools[key] = intVal != 0
+                            }
+                        }
                     }
                 }
                 // Parse function_calling mode from info.params.
@@ -1796,7 +1958,8 @@ final class APIClient: @unchecked Sendable {
                 profileImageURL: profileImageURL,
                 toolIds: toolIds,
                 defaultFeatureIds: defaultFeatureIds,
-                functionCallingMode: functionCallingMode
+                functionCallingMode: functionCallingMode,
+                builtinTools: builtinTools
             )
         }
     }
@@ -3019,5 +3182,61 @@ final class APIClient: @unchecked Sendable {
 
         let jsonData = try JSONSerialization.data(withJSONObject: response)
         return try JSONDecoder().decode(AdminUser.self, from: jsonData)
+    }
+}
+
+// MARK: - Redirect Capturing Delegate
+
+/// URLSessionDelegate that captures the final URL after all redirects.
+/// Used to detect HTTP→HTTPS upgrades performed by a load balancer so
+/// the app can update the stored server URL to the correct HTTPS address.
+private final class RedirectCapturingDelegate: NSObject, URLSessionDelegate, URLSessionTaskDelegate, @unchecked Sendable {
+    private let allowSelfSigned: Bool
+    private let serverConfig: ServerConfig
+    private let lock = NSLock()
+    private var _finalURL: URL?
+
+    var finalURL: URL? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _finalURL
+    }
+
+    init(allowSelfSigned: Bool, serverConfig: ServerConfig) {
+        self.allowSelfSigned = allowSelfSigned
+        self.serverConfig = serverConfig
+        super.init()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        // Capture the redirect destination URL
+        lock.lock()
+        _finalURL = request.url
+        lock.unlock()
+        // Allow the redirect to proceed
+        completionHandler(request)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard allowSelfSigned,
+              challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let serverTrust = challenge.protectionSpace.serverTrust,
+              let baseURL = URL(string: serverConfig.url),
+              challenge.protectionSpace.host.lowercased() == baseURL.host?.lowercased()
+        else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: serverTrust))
     }
 }

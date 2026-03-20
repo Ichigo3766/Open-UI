@@ -4,13 +4,14 @@ import os.log
 /// Observable view model that drives the Folders section of the chat list.
 ///
 /// Handles all folder CRUD operations with optimistic local updates,
-/// lazy-loading of folder contents, and debounced expand/collapse sync.
+/// lazy-loading of folder contents, debounced expand/collapse sync,
+/// active-folder workspace mode, full folder editing, and nested folder trees.
 @MainActor @Observable
 final class FolderListViewModel {
 
     // MARK: - Published State
 
-    /// All top-level (root) folders sorted by name.
+    /// All folders (flat list) from the server.
     var folders: [ChatFolder] = []
 
     /// Whether the initial folder load is in progress.
@@ -25,8 +26,17 @@ final class FolderListViewModel {
     /// Folder pending deletion (drives the delete confirmation).
     var deletingFolder: ChatFolder?
 
+    /// Whether to also delete all chats when deleting a folder.
+    var deleteContents: Bool = false
+
     /// Whether the "create folder" sheet is shown.
     var showCreateSheet: Bool = false
+
+    /// When creating a subfolder, this holds the parent folder ID.
+    var createSubfolderParentId: String?
+
+    /// Non-nil when a folder is being edited (drives the EditFolderSheet).
+    var editingFolder: ChatFolder?
 
     /// Non-nil when folders feature is confirmed disabled on this server.
     var featureDisabled: Bool = false
@@ -34,14 +44,29 @@ final class FolderListViewModel {
     /// ID of a folder currently highlighted as a drag drop target.
     var dragTargetFolderId: String?
 
-    /// ID of a folder that auto-expanded during a drag hover.
-    private var autoExpandedFolderId: String?
-    private var autoExpandTask: Task<Void, Never>?
+    /// The currently active folder workspace (nil = root/no folder context).
+    /// When set, new chats created in the app will be assigned to this folder.
+    var activeFolderId: String?
+
+    /// Full details of the active folder (loaded on selection, for system prompt / model IDs).
+    var activeFolderDetail: ChatFolder?
+
+    // MARK: - Computed: Tree
+
+    /// Root-level folders (parentId == nil) with childFolders recursively populated.
+    var rootFolders: [ChatFolder] {
+        buildTree(from: folders, parentId: nil)
+    }
+
+    /// Whether any folder is active as a workspace.
+    var hasActiveFolder: Bool { activeFolderId != nil }
 
     // MARK: - Private
 
     private var manager: FolderManager?
     private let logger = Logger(subsystem: "com.openui", category: "FolderListVM")
+    private var autoExpandedFolderId: String?
+    private var autoExpandTask: Task<Void, Never>?
 
     // MARK: - Setup
 
@@ -64,10 +89,17 @@ final class FolderListViewModel {
                 let existingExpandState = Dictionary(
                     uniqueKeysWithValues: folders.map { ($0.id, $0.isExpanded) }
                 )
+                // Preserve local chat lists so expanded folders don't go blank during refresh
+                let existingChats = Dictionary(
+                    uniqueKeysWithValues: folders.map { ($0.id, $0.chats) }
+                )
                 folders = fetched.map { folder in
                     var f = folder
                     if let existing = existingExpandState[folder.id] {
                         f.isExpanded = existing
+                    }
+                    if let chats = existingChats[folder.id], !chats.isEmpty {
+                        f.chats = chats
                     }
                     return f
                 }
@@ -119,24 +151,95 @@ final class FolderListViewModel {
         }
     }
 
+    // MARK: - Active Folder Workspace
+
+    /// Sets a folder as the active workspace. Loads full details (system prompt, model IDs).
+    /// Pass `nil` to clear the active folder (return to root workspace).
+    func setActiveFolder(_ folderId: String?) async {
+        guard let folderId else {
+            activeFolderId = nil
+            activeFolderDetail = nil
+            return
+        }
+
+        // Already active — no-op
+        if activeFolderId == folderId { return }
+
+        activeFolderId = folderId
+
+        // Load full details so we have system prompt & model IDs
+        if let manager {
+            do {
+                let detail = try await manager.fetchFolderById(id: folderId)
+                activeFolderDetail = detail
+                // Update cached folder data too
+                if let idx = folders.firstIndex(where: { $0.id == folderId }) {
+                    folders[idx].data = detail.data
+                    folders[idx].meta = detail.meta
+                }
+            } catch {
+                logger.error("Failed to load active folder details for \(folderId): \(error.localizedDescription)")
+                // Still set folder as active even if detail fetch fails
+                activeFolderDetail = folders.first(where: { $0.id == folderId })
+            }
+        } else {
+            activeFolderDetail = folders.first(where: { $0.id == folderId })
+        }
+    }
+
+    /// Clears the active folder workspace (back to root).
+    func clearActiveFolder() {
+        activeFolderId = nil
+        activeFolderDetail = nil
+    }
+
+    /// The system prompt to inject when creating a new chat in the active folder.
+    var activeFolderSystemPrompt: String? {
+        activeFolderDetail?.systemPrompt ?? folders.first(where: { $0.id == activeFolderId })?.systemPrompt
+    }
+
+    /// The model IDs from the active folder (first ID is the primary model).
+    var activeFolderModelIds: [String] {
+        activeFolderDetail?.modelIds ?? folders.first(where: { $0.id == activeFolderId })?.modelIds ?? []
+    }
+
     // MARK: - Create
 
-    /// Creates a new folder with the given name (optimistic insert).
+    /// Creates a new root-level folder with the given name (optimistic insert).
     func createFolder(name: String) async {
+        await createFolder(name: name, parentId: nil, data: nil, meta: nil)
+    }
+
+    /// Creates a new folder with optional parent (subfolder support).
+    func createFolder(name: String, parentId: String?) async {
+        await createFolder(name: name, parentId: parentId, data: nil, meta: nil)
+    }
+
+    /// Creates a new folder with optional parent and full settings (subfolder + project config).
+    func createFolder(name: String, parentId: String?, data: FolderData?, meta: FolderMeta?) async {
         guard let manager else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
         // Optimistic placeholder with a local ID
         let localId = "local-\(UUID().uuidString)"
-        let placeholder = ChatFolder(id: localId, name: trimmed)
+        let placeholder = ChatFolder(id: localId, name: trimmed, parentId: parentId, data: data, meta: meta)
         folders.append(placeholder)
 
         do {
-            let created = try await manager.createFolder(name: trimmed)
+            let created = try await manager.createFolder(name: trimmed, parentId: parentId, data: data, meta: meta)
             // Replace placeholder with real server model
             if let idx = folders.firstIndex(where: { $0.id == localId }) {
                 folders[idx] = created
+            }
+            // Sort after creation
+            folders.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+            // If there's a parent, auto-expand it so user sees the new subfolder
+            if let parentId,
+               let parentIdx = folders.firstIndex(where: { $0.id == parentId }),
+               !folders[parentIdx].isExpanded {
+                await toggleExpanded(folder: folders[parentIdx])
             }
         } catch {
             logger.error("Failed to create folder: \(error.localizedDescription)")
@@ -177,6 +280,7 @@ final class FolderListViewModel {
             if let idx = folders.firstIndex(where: { $0.id == folder.id }) {
                 folders[idx].name = updated.name
             }
+            folders.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         } catch {
             logger.error("Failed to rename folder: \(error.localizedDescription)")
             // Revert
@@ -186,22 +290,97 @@ final class FolderListViewModel {
         }
     }
 
+    // MARK: - Edit Folder (Full Settings)
+
+    /// Begins the edit flow for a folder. Loads full details from the server first.
+    func beginEdit(folder: ChatFolder) async {
+        guard let manager else {
+            editingFolder = folder
+            return
+        }
+
+        // Load full folder details (data + meta) before presenting the edit sheet
+        do {
+            let detail = try await manager.fetchFolderById(id: folder.id)
+            // Merge details into our cached folder
+            if let idx = folders.firstIndex(where: { $0.id == folder.id }) {
+                folders[idx].data = detail.data
+                folders[idx].meta = detail.meta
+            }
+            editingFolder = detail
+        } catch {
+            logger.error("Failed to load folder details for edit: \(error.localizedDescription)")
+            editingFolder = folder
+        }
+    }
+
+    /// Saves full folder settings (name, system prompt, model IDs, knowledge, background image).
+    func updateFolderSettings(
+        id: String,
+        name: String,
+        data: FolderData?,
+        meta: FolderMeta?
+    ) async {
+        guard let manager else { return }
+
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Optimistic update
+        if let idx = folders.firstIndex(where: { $0.id == id }) {
+            if !trimmedName.isEmpty { folders[idx].name = trimmedName }
+            folders[idx].data = data
+            folders[idx].meta = meta
+        }
+        // Update active folder detail if this is the active folder
+        if activeFolderId == id {
+            activeFolderDetail?.data = data
+            activeFolderDetail?.meta = meta
+            if !trimmedName.isEmpty { activeFolderDetail?.name = trimmedName }
+        }
+
+        do {
+            let updated = try await manager.updateFolder(
+                id: id,
+                name: trimmedName.isEmpty ? nil : trimmedName,
+                data: data,
+                meta: meta
+            )
+            if let idx = folders.firstIndex(where: { $0.id == id }) {
+                folders[idx].name = updated.name
+                folders[idx].data = updated.data
+                folders[idx].meta = updated.meta
+            }
+            if activeFolderId == id {
+                activeFolderDetail = updated
+            }
+            folders.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        } catch {
+            logger.error("Failed to update folder settings: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Delete
 
-    /// Deletes a folder and moves its chats out (server handles orphaning).
-    func deleteFolder(id: String) async {
+    /// Deletes a folder. When `deleteContents` is true, also deletes all chats.
+    func deleteFolder(id: String, deleteContents: Bool = false) async {
         guard let manager else { return }
 
         let removed = folders.first { $0.id == id }
         folders.removeAll { $0.id == id }
 
+        // Clear active folder if it's the deleted one
+        if activeFolderId == id {
+            clearActiveFolder()
+        }
+
         do {
-            try await manager.deleteFolder(id: id)
+            try await manager.deleteFolder(id: id, deleteContents: deleteContents)
         } catch {
             logger.error("Failed to delete folder: \(error.localizedDescription)")
             // Revert
             if let removed {
                 folders.append(removed)
+                folders.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             }
         }
     }
@@ -240,7 +419,6 @@ final class FolderListViewModel {
             try await manager.moveChat(conversationId: conversationId, to: folderId)
 
             // Reload the destination folder's chat list from the server
-            // so the UI shows the chat instantly without a sidebar close/reopen.
             if let dstId = folderId,
                let dstIdx = folders.firstIndex(where: { $0.id == dstId }) {
                 let freshChats = try await manager.fetchChatsInFolder(folderId: dstId)
@@ -269,6 +447,21 @@ final class FolderListViewModel {
                 folders[dstIdx].chats.removeAll { $0.id == conversationId }
             }
         }
+    }
+
+    // MARK: - Nested Folder Tree
+
+    /// Builds a recursive folder tree. Returned array is root-level folders,
+    /// each with `childFolders` populated recursively.
+    private func buildTree(from all: [ChatFolder], parentId: String?) -> [ChatFolder] {
+        all
+            .filter { $0.parentId == parentId }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            .map { folder in
+                var f = folder
+                f.childFolders = buildTree(from: all, parentId: folder.id)
+                return f
+            }
     }
 
     // MARK: - Drag & Drop Helpers
@@ -320,14 +513,20 @@ final class FolderListViewModel {
             featureDisabled = !enabled
             guard enabled else { return }
 
-            // Preserve local expand states
+            // Preserve local expand states and chats
             let existingExpandState = Dictionary(
                 uniqueKeysWithValues: folders.map { ($0.id, $0.isExpanded) }
+            )
+            let existingChats = Dictionary(
+                uniqueKeysWithValues: folders.map { ($0.id, $0.chats) }
             )
             folders = fetched.map { folder in
                 var f = folder
                 if let existing = existingExpandState[folder.id] {
                     f.isExpanded = existing
+                }
+                if let chats = existingChats[folder.id], !chats.isEmpty {
+                    f.chats = chats
                 }
                 return f
             }
@@ -340,6 +539,16 @@ final class FolderListViewModel {
                         guard let self else { return }
                         await self.loadChatsIfNeeded(for: folder)
                     }
+                }
+            }
+
+            // Refresh active folder details if one is active
+            if let activeFolderId {
+                do {
+                    let detail = try await manager.fetchFolderById(id: activeFolderId)
+                    activeFolderDetail = detail
+                } catch {
+                    // Non-critical — keep existing detail
                 }
             }
         } catch {
@@ -365,5 +574,16 @@ final class FolderListViewModel {
                 return
             }
         }
+    }
+
+    /// Returns the name of the active folder (for display in UI banners).
+    var activeFolderName: String? {
+        activeFolderDetail?.name ?? folders.first(where: { $0.id == activeFolderId })?.name
+    }
+
+    /// Returns child folders of a given folder from the flat list.
+    func childFolders(of folderId: String) -> [ChatFolder] {
+        folders.filter { $0.parentId == folderId }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 }

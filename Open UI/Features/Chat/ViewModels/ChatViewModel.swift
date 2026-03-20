@@ -6,6 +6,9 @@ extension Notification.Name {
     static let conversationTitleUpdated = Notification.Name("conversationTitleUpdated")
     static let navigateToChannel = Notification.Name("navigateToChannel")
     static let conversationListNeedsRefresh = Notification.Name("conversationListNeedsRefresh")
+    /// Posted by MemoriesView when the user toggles the Enable Memory switch.
+    /// `object` is the new Bool value so ChatViewModel updates immediately.
+    static let memorySettingChanged = Notification.Name("memorySettingChanged")
     /// Posted by AdminConsoleView when a user's chat is cloned.
     static let adminClonedChat = Notification.Name("adminClonedChat")
     /// Posted by the audio attachment thumbnail's retry button.
@@ -29,6 +32,28 @@ final class ChatViewModel {
 
     var conversation: Conversation?
     var availableModels: [AIModel] = []
+
+    // MARK: - Folder Context
+
+    /// When set, new chats will be created inside this folder and use this system prompt.
+    var folderContextId: String?
+    var folderContextSystemPrompt: String?
+    var folderContextModelIds: [String] = []
+
+    /// Sets or clears the folder workspace context.
+    /// Called when the user taps a folder name in the drawer.
+    func setFolderContext(folderId: String?, systemPrompt: String?, modelIds: [String] = []) {
+        folderContextId = folderId
+        folderContextSystemPrompt = systemPrompt
+        folderContextModelIds = modelIds
+        // If the folder has default model IDs and we have no model selected, pick the first
+        if let firstModel = modelIds.first, !firstModel.isEmpty {
+            let available = availableModels.map(\.id)
+            if available.contains(firstModel) {
+                selectModel(firstModel)
+            }
+        }
+    }
     var selectedModelId: String?
     var isStreaming: Bool = false
     var isLoadingConversation: Bool = false
@@ -39,6 +64,9 @@ final class ChatViewModel {
     var webSearchEnabled: Bool = false
     var imageGenerationEnabled: Bool = false
     var codeInterpreterEnabled: Bool = false
+    /// Whether memory is enabled for this chat session.
+    /// Persisted to server user settings (`ui.memory`) so the web UI stays in sync.
+    var memoryEnabled: Bool = false
     var isTemporaryChat: Bool = false
     var availableTools: [ToolItem] = []
     var selectedToolIds: Set<String> = [] {
@@ -298,6 +326,7 @@ final class ChatViewModel {
         self.activeChatStore = store
         self.asrService = asr
         setupRetryAttachmentObserver()
+        setupMemorySettingObserver()
     }
 
     /// Registers the observer that handles retry requests posted by the
@@ -323,6 +352,23 @@ final class ChatViewModel {
                     self.attachments[idx].uploadError = nil
                 }
                 self.uploadAttachmentImmediately(attachmentId: attachmentId)
+            }
+        }
+    }
+
+    /// Registers an observer for `.memorySettingChanged` so that when the user
+    /// toggles memory in Settings → Personalization → Memories, all active
+    /// ChatViewModels update `memoryEnabled` immediately without a server refetch.
+    private func setupMemorySettingObserver() {
+        NotificationCenter.default.addObserver(
+            forName: .memorySettingChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self, let newValue = notification.object as? Bool else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.memoryEnabled = newValue
             }
         }
     }
@@ -1827,7 +1873,8 @@ final class ChatViewModel {
         let modelId = selectedModelId ?? conversation.model ?? ""
         do {
             let created = try await manager.createConversation(
-                title: conversation.title, messages: [], model: modelId)
+                title: conversation.title, messages: [], model: modelId,
+                folderId: folderContextId)
             // Update the conversation ID to the server-assigned one
             self.conversation?.id = created.id
             // Sync all messages
@@ -1976,7 +2023,8 @@ final class ChatViewModel {
             if !isTemporaryChat {
                 do {
                     let created = try await manager.createConversation(
-                        title: chatTitle, messages: [], model: modelId)
+                        title: chatTitle, messages: [], model: modelId,
+                        folderId: folderContextId)
                     serverId = created.id
                 } catch {
                     logger.warning("Pre-create failed: \(error.localizedDescription)")
@@ -3367,6 +3415,12 @@ final class ChatViewModel {
         }
     }
 
+    /// Whether the selected model supports the memory builtin tool.
+    /// Controls visibility of the memory toggle in ToolsMenuSheet.
+    var isMemoryAvailable: Bool {
+        selectedModel?.supportsMemory ?? false
+    }
+
     /// Syncs the UI toggles (web search pill, selected tools) with the selected
     /// model's server-configured defaults. Matches the OpenWebUI web client's
     /// `setDefaults()` which pre-enables features and tools from model metadata.
@@ -3393,6 +3447,11 @@ final class ChatViewModel {
         imageGenerationEnabled = defaults.contains("image_generation") && isTruthy("image_generation")
         codeInterpreterEnabled = defaults.contains("code_interpreter") && isTruthy("code_interpreter")
 
+        // Memory is an account-level preference stored server-side (ui.memory).
+        // Fetch it once for all models (not just memory-capable ones) so the
+        // value is cached for when a capable model is selected later.
+        Task { await fetchMemorySettingFromServer() }
+
         // Reset and re-populate tool selections for this model.
         // Clear first so tools from a previous model don't persist.
         selectedToolIds = []
@@ -3407,14 +3466,50 @@ final class ChatViewModel {
         }
     }
 
+    /// Fetches the user's memory preference from the server.
+    ///
+    /// Calls `GET /api/v1/users/user/settings` and reads `ui.memory`.
+    /// This is the same endpoint the web UI writes to when the user
+    /// toggles memory in Settings → Personalization. Fire-and-forget
+    /// — failure just leaves `memoryEnabled` at its last known value.
+    func fetchMemorySettingFromServer() async {
+        guard let apiClient = manager?.apiClient else { return }
+        do {
+            let settings = try await apiClient.getUserSettings()
+            if let ui = settings["ui"] as? [String: Any],
+               let memory = ui["memory"] as? Bool {
+                memoryEnabled = memory
+                logger.debug("Memory setting fetched: \(memory)")
+            }
+        } catch {
+            logger.debug("Failed to fetch memory setting: \(error.localizedDescription)")
+        }
+    }
+
+    /// Persists the memory toggle state to the server user settings.
+    ///
+    /// Calls `POST /api/v1/users/user/settings/update` with `{"ui":{"memory":enabled}}`
+    /// so the web UI and app stay in sync. Fire-and-forget — the toggle
+    /// is already updated locally.
+    func updateMemorySettingOnServer(enabled: Bool) {
+        guard let apiClient = manager?.apiClient else { return }
+        Task {
+            do {
+                try await apiClient.updateUserSettings(["ui": ["memory": enabled]])
+                logger.debug("Memory setting saved to server: \(enabled)")
+            } catch {
+                logger.debug("Failed to save memory setting: \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// Builds chat features by merging user toggles with the model's admin-configured
     /// default features. Matches the OpenWebUI web client's `setDefaults()` + `getFeatures()`.
     ///
-    /// For each feature ID in the model's `defaultFeatureIds`, the corresponding
-    /// capability must also be enabled (truthy) on the model. This mirrors how
-    /// the web client checks `model.info.meta.capabilities[featureId]` before
-    /// enabling a default feature. Fully dynamic — if OpenWebUI adds new feature
-    /// types (e.g., `code_interpreter`), they'll be picked up automatically.
+    /// Memory is based solely on the user's account setting (`memoryEnabled`), matching
+    /// the web client which sends `features.memory` based on `$user.settings.ui.memory`
+    /// without gating on per-model `builtinTools`. The server already knows which models
+    /// support memory and ignores the flag for models that don't.
     private func buildChatFeatures() -> ChatCompletionRequest.ChatFeatures {
         var features = ChatCompletionRequest.ChatFeatures()
 
@@ -3432,6 +3527,12 @@ final class ChatViewModel {
         }
         if codeInterpreterEnabled {
             features.codeInterpreter = true
+        }
+        // Memory: send based on account-level setting only (matches web client).
+        // No gate on selectedModel?.supportsMemory — the server decides per-model
+        // whether to inject the memory tool; we just relay the user's preference.
+        if memoryEnabled {
+            features.memory = true
         }
 
         return features

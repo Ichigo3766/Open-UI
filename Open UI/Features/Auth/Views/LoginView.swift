@@ -445,19 +445,41 @@ struct AuthMethodSelectionView: View {
 
                 Spacer(minLength: Spacing.xl)
 
-                // Change server button
-                Button {
-                    viewModel.disconnect()
-                } label: {
-                    HStack(spacing: Spacing.sm) {
-                        Image(systemName: "arrow.left.circle")
-                            .scaledFont(size: 14)
-                        Text("Connect to a different server")
-                            .scaledFont(size: 14)
+                // Manage servers — switches context without destroying saved data
+                VStack(spacing: Spacing.sm) {
+                    if !viewModel.savedServers.isEmpty {
+                        Button {
+                            withAnimation {
+                                viewModel.phase = .serverSwitcher
+                            }
+                        } label: {
+                            HStack(spacing: Spacing.sm) {
+                                Image(systemName: "arrow.left.arrow.right.circle")
+                                    .scaledFont(size: 14)
+                                Text(viewModel.savedServers.count > 1
+                                     ? "Switch server (\(viewModel.savedServers.count) saved)"
+                                     : "Add or switch server")
+                                    .scaledFont(size: 14)
+                            }
+                            .foregroundStyle(theme.brandPrimary.opacity(0.8))
+                        }
+                    } else {
+                        Button {
+                            withAnimation {
+                                viewModel.phase = .serverConnection
+                            }
+                        } label: {
+                            HStack(spacing: Spacing.sm) {
+                                Image(systemName: "arrow.left.circle")
+                                    .scaledFont(size: 14)
+                                Text("Connect to a different server")
+                                    .scaledFont(size: 14)
+                            }
+                            .foregroundStyle(theme.textTertiary)
+                        }
                     }
-                    .foregroundStyle(theme.textTertiary)
                 }
-                .opacity(appeared ? 0.7 : 0)
+                .opacity(appeared ? 0.9 : 0)
                 .animation(.easeOut(duration: 0.3).delay(0.8), value: appeared)
                 .padding(.bottom, Spacing.lg)
             }

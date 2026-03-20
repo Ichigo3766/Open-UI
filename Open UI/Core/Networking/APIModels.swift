@@ -309,7 +309,10 @@ struct ChatCompletionRequest: Sendable {
             feat["web_search"] = features.webSearch
             feat["image_generation"] = features.imageGeneration
             feat["code_interpreter"] = features.codeInterpreter
-            if features.memory { feat["memory"] = true }
+            // Always send memory explicitly (true/false) so the server never
+            // falls back to model defaults. Matches web client behavior where
+            // memory is sent based purely on the user's account setting.
+            feat["memory"] = features.memory
             data["features"] = feat
         }
 

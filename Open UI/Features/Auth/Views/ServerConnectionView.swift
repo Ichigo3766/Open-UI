@@ -284,6 +284,9 @@ struct ServerConnectionView: View {
                                         .labelsHidden()
                                         .tint(theme.brandPrimary)
                                 }
+
+                                // Custom Headers
+                                CustomHeadersEditor(entries: $viewModel.customHeaderEntries)
                             }
                             .padding(.top, Spacing.md)
                         } label: {
@@ -337,6 +340,26 @@ struct ServerConnectionView: View {
                     .padding(.horizontal, Spacing.screenPadding)
                     .opacity(appeared ? 1 : 0)
                     .offset(y: appeared ? 0 : 30)
+
+                    // Saved servers — shown when the user has previously connected servers
+                    if !viewModel.savedServers.isEmpty {
+                        VStack(alignment: .leading, spacing: Spacing.sm) {
+                            CompactSavedServersSection(viewModel: viewModel)
+                        }
+                        .padding(Spacing.lg)
+                        .background(
+                            RoundedRectangle(cornerRadius: CornerRadius.xl, style: .continuous)
+                                .fill(.ultraThinMaterial)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: CornerRadius.xl, style: .continuous)
+                                .strokeBorder(theme.cardBorder.opacity(0.5), lineWidth: 0.5)
+                        )
+                        .padding(.horizontal, Spacing.screenPadding)
+                        .opacity(appeared ? 1 : 0)
+                        .offset(y: appeared ? 0 : 30)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
 
                     Spacer(minLength: 40)
 

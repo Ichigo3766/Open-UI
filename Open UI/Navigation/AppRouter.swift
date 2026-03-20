@@ -50,4 +50,16 @@ final class AppRouter {
         isVoiceCallPresented = false
         voiceCallViewModel = nil
     }
+
+    /// Resets all navigation state to root — called on server switch so stale
+    /// screens (chat detail, settings, etc.) from the previous server don't persist.
+    func resetAll() {
+        path = NavigationPath()
+        channelPath = NavigationPath()
+        presentedSheet = nil
+        if isVoiceCallPresented {
+            isVoiceCallPresented = false
+            voiceCallViewModel = nil
+        }
+    }
 }

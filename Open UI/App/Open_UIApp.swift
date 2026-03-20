@@ -32,6 +32,12 @@ struct Open_UIApp: App {
             RootView()
                 .environment(router)
                 .environment(dependencies)
+                .task {
+                    // Wire the router into the dependency container so AuthViewModel
+                    // can reset navigation on server switch (must be done after both
+                    // objects are injected into the environment).
+                    dependencies.router = router
+                }
                 .preferredColorScheme(dependencies.appearanceManager.resolvedColorScheme)
                 .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
                 .onChange(of: scenePhase) { _, newPhase in
@@ -235,6 +241,16 @@ struct RootView: View {
 
             case .authenticated:
                 authenticatedContent
+
+            case .serverSwitcher:
+                NavigationStack {
+                    ScrollView {
+                        SavedServersView(viewModel: viewModel, showAddServerButton: true)
+                    }
+                    .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
+                    .navigationTitle("Switch Server")
+                    .navigationBarTitleDisplayMode(.inline)
+                }
             }
         }
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: viewModel.phase)
@@ -244,13 +260,20 @@ struct RootView: View {
 
             guard dependencies.serverConfigStore.activeServer != nil else { return }
 
-            if viewModel.phase == .authenticated {
+            switch viewModel.phase {
+            case .authenticated:
                 // Optimistic auth — user is already seeing the chat screen.
                 // Validate the token silently in the background.
                 await viewModel.validateSessionInBackground()
-            } else if viewModel.phase == .restoringSession {
-                // No cached user — must validate before showing chat.
+            case .restoringSession:
+                // Have token but no cached user — must validate before showing chat.
                 await viewModel.restoreSession()
+            case .authMethodSelection:
+                // Signed out but server is saved — fetch backend config so that
+                // login/SSO options are populated correctly without requiring a reconnect.
+                await viewModel.fetchBackendConfigIfNeeded()
+            default:
+                break
             }
         }
     }

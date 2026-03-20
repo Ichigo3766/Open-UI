@@ -3,15 +3,40 @@
 ## 📦 NEXT BUILD
 
 ### What's New
-- Memories fully implemented within the app
-Added Enable Memory toggle in Settings → Personalization → Memories to control whether AI assistants remember context about you across conversations, synced with the web UI.
 
 ### Improvements
-- Added a dedicated Feedback section in Settings → About with direct links to structured GitHub issue forms for bug reports, feature requests, UI/UX feedback, performance issues, and questions.
 
 ### Bug Fixes
 
+
 ## Previous Builds
+
+## v1.3 — March 20, 2026
+
+### What's New
+- Added multi-server management — save multiple OpenWebUI server connections and switch between them instantly from Settings or the server connection screen.
+- Chat sharing is now fully functional. Long-press any conversation and tap Share to open the share menu.
+- Complete support for memories — Added Enable Memory toggle in Settings → Personalization → Memories to control whether AI assistants remember context about you across conversations, synced with the web UI.
+- Folders now support full project workspace configuration — long-press any folder to edit its name, system prompt, default models, and attached knowledge bases (RAG context for all chats in the folder).
+- Added custom headers on sign in.
+
+### Improvements
+- On iPad with a Magic Keyboard or other hardware keyboard, pressing Enter now sends the message and Shift+Enter inserts a new line — matching the natural expectation when typing on a physical keyboard.
+- Added a dedicated Feedback section in Settings → About.
+- Compacted the channel toolbar action icons (pin, members, settings) for better visual balance.
+- Added a "New Chat" button to the drawer bottom bar so you can start a new chat from anywhere, including while inside a channel.
+- All drawer rows (channels, chats, folders) are now tappable across the full row width, not just over the text.
+
+### Bug Fixes
+- Fixed email/password login failing with "Failed to decode response" when connecting via an HTTP URL that redirects to HTTPS — the app now automatically detects and upgrades to the HTTPS address.
+- Fixed OAuth sign-in getting stuck on "Authenticating…" indefinitely after a successful OAuth flow — login now completes correctly.
+- Fixed member avatars not showing properly throughout channels UI.
+- Fixed selected members not appearing in the "Initial Members" list when adding them during Group channel creation.
+- Fixed welcome screen prompt cards not appearing on the very first app launch.
+- Fixed chats not loading older than a month — chats now properly load and match the OpenWebUI grouping.
+- Fixed starter prompts, if enabled, not loading on first startup after login.
+- Fixed model and user avatar images showing an infinite loading shimmer on servers using self-signed certificates.
+
 
 ## v1.2.1 — March 18, 2026
 

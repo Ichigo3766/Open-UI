@@ -7,6 +7,7 @@ struct ServerManagementView: View {
     @State private var editingURL: String = ""
     @State private var editingName: String = ""
     @State private var editingSelfSigned: Bool = false
+    @State private var editingHeaderEntries: [CustomHeaderEntry] = []
     @State private var isEditing: Bool = false
     @State private var showDeleteConfirmation = false
     @State private var serverHealthy: Bool?
@@ -249,6 +250,13 @@ struct ServerManagementView: View {
         editingURL = activeServer?.url ?? ""
         editingName = activeServer?.name ?? ""
         editingSelfSigned = activeServer?.allowSelfSignedCertificates ?? false
+        // Convert persisted [String:String] dict back to editable entries.
+        // Skip system-managed headers (User-Agent set by CF/proxy flows).
+        let systemKeys: Set<String> = ["User-Agent"]
+        editingHeaderEntries = (activeServer?.customHeaders ?? [:])
+            .filter { !systemKeys.contains($0.key) }
+            .map { CustomHeaderEntry(id: UUID().uuidString, key: $0.key, value: $0.value) }
+            .sorted { $0.key < $1.key }
         isEditing = true
     }
 
@@ -269,6 +277,16 @@ struct ServerManagementView: View {
 
                 Section("Security") {
                     Toggle("Allow Self-Signed Certificates", isOn: $editingSelfSigned)
+                }
+
+                Section {
+                    CustomHeadersEditor(entries: $editingHeaderEntries)
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                } header: {
+                    Text("Custom Headers")
+                } footer: {
+                    Text("HTTP headers sent with every request to this server. Useful for reverse proxies or services that require extra authentication headers.")
+                        .font(.caption)
                 }
             }
             .navigationTitle("Edit Server")
@@ -293,6 +311,18 @@ struct ServerManagementView: View {
         config.url = editingURL
         config.name = editingName
         config.allowSelfSignedCertificates = editingSelfSigned
+
+        // Merge user-edited headers back in. Preserve system-managed headers
+        // (CF User-Agent etc.) that were stripped out of the editing UI.
+        let systemKeys: Set<String> = ["User-Agent"]
+        var updatedHeaders: [String: String] = config.customHeaders.filter { systemKeys.contains($0.key) }
+        for entry in editingHeaderEntries {
+            let trimmedKey = entry.key.trimmingCharacters(in: .whitespaces)
+            guard !trimmedKey.isEmpty else { continue }
+            updatedHeaders[trimmedKey] = entry.value
+        }
+        config.customHeaders = updatedHeaders
+
         dependencies.serverConfigStore.updateServer(config)
         dependencies.refreshServices()
     }

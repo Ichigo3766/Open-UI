@@ -53,11 +53,58 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
     /// Populated transiently at runtime via ``KeychainService``.
     var apiKey: String?
 
+    // MARK: - Per-server user metadata (for server switcher UI)
+
+    /// Display name of the last authenticated user on this server.
+    /// Shown in the server list so users can identify which account is associated.
+    var lastUserName: String?
+
+    /// Email of the last authenticated user on this server.
+    var lastUserEmail: String?
+
+    /// Profile image URL of the last authenticated user.
+    var lastUserProfileImageURL: String?
+
+    /// Auth type used for the last successful login.
+    var lastAuthType: AuthType?
+
+    /// Whether this server had a valid, confirmed session at last use.
+    /// Used to show the "Connected" vs "Saved" vs "Expired" badge in the server list.
+    var hasActiveSession: Bool
+
     // Exclude apiKey from Codable to prevent plaintext storage in UserDefaults.
     enum CodingKeys: String, CodingKey {
         case id, name, url, customHeaders, lastConnected, isActive, allowSelfSignedCertificates
         case cfClearanceValue, cfClearanceExpiry, cfUserAgent, isCloudflareBotProtected
         case proxyAuthCookies, isAuthProxyProtected, proxyAuthPortalURL
+        case lastUserName, lastUserEmail, lastUserProfileImageURL, lastAuthType, hasActiveSession
+    }
+
+    /// Custom decoder so existing saved configs (without the new metadata fields)
+    /// decode successfully instead of throwing `keyNotFound` and wiping the server list.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        url = try c.decode(String.self, forKey: .url)
+        customHeaders = (try? c.decode([String: String].self, forKey: .customHeaders)) ?? [:]
+        lastConnected = try? c.decode(Date.self, forKey: .lastConnected)
+        isActive = (try? c.decode(Bool.self, forKey: .isActive)) ?? false
+        allowSelfSignedCertificates = (try? c.decode(Bool.self, forKey: .allowSelfSignedCertificates)) ?? false
+        cfClearanceValue = try? c.decode(String.self, forKey: .cfClearanceValue)
+        cfClearanceExpiry = try? c.decode(Date.self, forKey: .cfClearanceExpiry)
+        cfUserAgent = try? c.decode(String.self, forKey: .cfUserAgent)
+        isCloudflareBotProtected = (try? c.decode(Bool.self, forKey: .isCloudflareBotProtected)) ?? false
+        proxyAuthCookies = try? c.decode([String: String].self, forKey: .proxyAuthCookies)
+        isAuthProxyProtected = (try? c.decode(Bool.self, forKey: .isAuthProxyProtected)) ?? false
+        proxyAuthPortalURL = try? c.decode(String.self, forKey: .proxyAuthPortalURL)
+        // New metadata fields — default gracefully when absent (backwards compat)
+        lastUserName = try? c.decode(String.self, forKey: .lastUserName)
+        lastUserEmail = try? c.decode(String.self, forKey: .lastUserEmail)
+        lastUserProfileImageURL = try? c.decode(String.self, forKey: .lastUserProfileImageURL)
+        lastAuthType = try? c.decode(AuthType.self, forKey: .lastAuthType)
+        hasActiveSession = (try? c.decode(Bool.self, forKey: .hasActiveSession)) ?? false
+        apiKey = nil // always nil from storage; loaded from Keychain at runtime
     }
 
     init(
@@ -75,7 +122,12 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         isCloudflareBotProtected: Bool = false,
         proxyAuthCookies: [String: String]? = nil,
         isAuthProxyProtected: Bool = false,
-        proxyAuthPortalURL: String? = nil
+        proxyAuthPortalURL: String? = nil,
+        lastUserName: String? = nil,
+        lastUserEmail: String? = nil,
+        lastUserProfileImageURL: String? = nil,
+        lastAuthType: AuthType? = nil,
+        hasActiveSession: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -92,6 +144,11 @@ struct ServerConfig: Codable, Identifiable, Hashable, Sendable {
         self.proxyAuthCookies = proxyAuthCookies
         self.isAuthProxyProtected = isAuthProxyProtected
         self.proxyAuthPortalURL = proxyAuthPortalURL
+        self.lastUserName = lastUserName
+        self.lastUserEmail = lastUserEmail
+        self.lastUserProfileImageURL = lastUserProfileImageURL
+        self.lastAuthType = lastAuthType
+        self.hasActiveSession = hasActiveSession
     }
 
     /// Whether the persisted `cf_clearance` cookie is still valid (not expired).

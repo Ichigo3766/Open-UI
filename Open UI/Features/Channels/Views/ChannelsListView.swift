@@ -459,7 +459,7 @@ struct CreateChannelSheet: View {
     /// Resolved members for group creation display (avoids inline filter ambiguity).
     private var selectedGroupMembers: [ChannelMember] {
         let ids = selectedGroupMemberIds
-        return allUsers.filter { ids.contains($0.id) }
+        return effectiveUsers.filter { ids.contains($0.id) }
     }
     
     @State private var togglingMemberIds: Set<String> = []
@@ -712,7 +712,7 @@ struct CreateChannelSheet: View {
                     AddAccessSheet(
                         channelId: editingChannel?.id ?? "",
                         existingMemberIds: existingGroupMemberIds,
-                        allUsers: allUsers,
+                        allUsers: effectiveUsers,
                         isLoading: isAddingMembers,
                         serverBaseURL: apiClient?.baseURL ?? "",
                         authToken: apiClient?.network.authToken,
@@ -729,7 +729,7 @@ struct CreateChannelSheet: View {
                     AddAccessSheet(
                         channelId: channel.id,
                         existingMemberIds: existingGrantUserIds,
-                        allUsers: allUsers,
+                        allUsers: effectiveUsers,
                         isLoading: isAddingMembers,
                         serverBaseURL: apiClient?.baseURL ?? "",
                         authToken: apiClient?.network.authToken,
@@ -840,7 +840,11 @@ struct CreateChannelSheet: View {
         HStack(spacing: Spacing.sm) {
             UserAvatar(
                 size: 30,
-                imageURL: member.resolveAvatarURL(serverBaseURL: apiClient?.baseURL ?? ""),
+                imageURL: {
+                    let base = apiClient?.baseURL ?? ""
+                    guard !base.isEmpty else { return nil }
+                    return URL(string: "\(base)/api/v1/users/\(member.id)/profile/image")
+                }(),
                 name: member.displayName,
                 authToken: apiClient?.network.authToken
             )
@@ -914,7 +918,11 @@ struct CreateChannelSheet: View {
         HStack(spacing: Spacing.sm) {
             UserAvatar(
                 size: 30,
-                imageURL: member.resolveAvatarURL(serverBaseURL: apiClient?.baseURL ?? ""),
+                imageURL: {
+                    let base = apiClient?.baseURL ?? ""
+                    guard !base.isEmpty else { return nil }
+                    return URL(string: "\(base)/api/v1/users/\(member.id)/profile/image")
+                }(),
                 name: member.displayName,
                 authToken: apiClient?.network.authToken
             )
@@ -965,7 +973,11 @@ struct CreateChannelSheet: View {
                     HStack(spacing: Spacing.sm) {
                         UserAvatar(
                             size: 28,
-                            imageURL: user.resolveAvatarURL(serverBaseURL: apiClient?.baseURL ?? ""),
+                            imageURL: {
+                                let base = apiClient?.baseURL ?? ""
+                                guard !base.isEmpty else { return nil }
+                                return URL(string: "\(base)/api/v1/users/\(user.id)/profile/image")
+                            }(),
                             name: user.displayName,
                             authToken: apiClient?.network.authToken
                         )
@@ -1027,7 +1039,11 @@ struct CreateChannelSheet: View {
                     HStack(spacing: Spacing.sm) {
                         UserAvatar(
                             size: 32,
-                            imageURL: user.resolveAvatarURL(serverBaseURL: apiClient?.baseURL ?? ""),
+                            imageURL: {
+                                let base = apiClient?.baseURL ?? ""
+                                guard !base.isEmpty else { return nil }
+                                return URL(string: "\(base)/api/v1/users/\(user.id)/profile/image")
+                            }(),
                             name: user.displayName,
                             authToken: apiClient?.network.authToken
                         )
@@ -1215,7 +1231,10 @@ struct AddAccessSheet: View {
                             HStack(spacing: Spacing.sm) {
                                 UserAvatar(
                                     size: 32,
-                                    imageURL: user.resolveAvatarURL(serverBaseURL: serverBaseURL),
+                                    imageURL: {
+                                        guard !serverBaseURL.isEmpty else { return nil }
+                                        return URL(string: "\(serverBaseURL)/api/v1/users/\(user.id)/profile/image")
+                                    }(),
                                     name: user.displayName,
                                     authToken: authToken
                                 )
