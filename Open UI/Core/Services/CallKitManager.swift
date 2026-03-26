@@ -28,6 +28,9 @@ final class CallKitManager: NSObject {
     /// Called when the user toggles hold from the CallKit UI.
     var onHoldToggled: ((Bool) -> Void)?
 
+    /// Called when CallKit activates the audio session so the speaker override can be re-applied.
+    var onAudioSessionActivated: (() -> Void)?
+
     // MARK: - Private
 
     private let logger = Logger(subsystem: "com.openui", category: "CallKit")
@@ -171,7 +174,10 @@ extension CallKitManager: CXProviderDelegate {
     }
 
     nonisolated func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
-        // Audio session activated by CallKit
+        // Re-apply speaker override after CallKit takes control of the audio session
+        Task { @MainActor [weak self] in
+            self?.onAudioSessionActivated?()
+        }
     }
 
     nonisolated func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {

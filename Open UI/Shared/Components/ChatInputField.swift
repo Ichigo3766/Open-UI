@@ -102,6 +102,10 @@ struct ChatInputField: View {
     var onSlashTrigger: ((String) -> Void)?
     var onSlashDismiss: (() -> Void)?
 
+    // Skills bindings ($ trigger)
+    var onDollarTrigger: ((String) -> Void)?
+    var onDollarDismiss: (() -> Void)?
+
     // Attachment callbacks
     var onFileAttachment: (() -> Void)?
     var onPhotoAttachment: (() -> Void)?
@@ -177,6 +181,11 @@ struct ChatInputField: View {
         }
         .padding(.top, Spacing.xs)
         .padding(.bottom, Spacing.sm)
+        // Widget deep link — focus the text field and show keyboard when
+        // the user taps the "New Chat" action button on the home screen widget.
+        .onReceive(NotificationCenter.default.publisher(for: .chatInputFieldRequestFocus)) { _ in
+            isFocused = true
+        }
         .sheet(isPresented: $showToolsSheet) {
             ToolsMenuSheet(
                 webSearchEnabled: $webSearchEnabled,
@@ -350,6 +359,8 @@ struct ChatInputField: View {
             onAtDismiss: onAtDismiss,
             onSlashTrigger: onSlashTrigger,
             onSlashDismiss: onSlashDismiss,
+            onDollarTrigger: onDollarTrigger,
+            onDollarDismiss: onDollarDismiss,
             sendOnReturn: sendOnEnter
         )
         .fixedSize(horizontal: false, vertical: true)

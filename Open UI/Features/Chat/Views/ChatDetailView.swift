@@ -40,6 +40,7 @@ struct ChatDetailView: View {
     @State private var activeActionMessageId: String?
     @State private var activeVersionIndex: [String: Int] = [:]
     @State private var speakingMessageId: String?
+    @State private var usagePopoverMessageId: String?
     @State private var sourcesSheetMessage: ChatMessage?
     @State private var randomPrompts: [SuggestedPrompt] = []
 
@@ -59,6 +60,7 @@ struct ChatDetailView: View {
     // MARK: Attachment pickers
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var showFilePicker = false
+    @State private var showPhotosPicker = false
     @State private var showAudioPicker = false
     @State private var showCameraPicker = false
     @State private var showWebURLAlert = false
@@ -159,6 +161,27 @@ struct ChatDetailView: View {
                 .animation(.easeOut(duration: 0.2), value: vm.isShowingPromptPicker)
             }
         }
+        // Skill picker — overlays content (floats over welcome cards / messages)
+        .overlay(alignment: .bottom) {
+            if vm.isShowingSkillPicker {
+                SkillPickerView(
+                    query: vm.skillSearchQuery,
+                    skills: vm.availableSkills,
+                    isLoading: vm.isLoadingSkills,
+                    onSelect: { skill in
+                        viewModel.selectSkill(skill)
+                    },
+                    onDismiss: {
+                        viewModel.dismissSkillPicker()
+                    }
+                )
+                .transition(.asymmetric(
+                    insertion: .move(edge: .bottom).combined(with: .opacity),
+                    removal: .opacity
+                ))
+                .animation(.easeOut(duration: 0.2), value: vm.isShowingSkillPicker)
+            }
+        }
         // Model picker — overlays content (floats over welcome cards / messages)
         .overlay(alignment: .bottom) {
             if isShowingModelPicker {
@@ -228,6 +251,11 @@ struct ChatDetailView: View {
         }
         .onDisappear {
             keyboard.stop()
+            // Stop TTS playback and clear state when navigating away from chat
+            if speakingMessageId != nil {
+                dependencies.textToSpeechService.stop()
+                speakingMessageId = nil
+            }
             NotificationService.shared.activeConversationId = nil
         }
         // Stop TTS when app enters background to prevent Metal GPU crashes
@@ -366,16 +394,15 @@ struct ChatDetailView: View {
         }
         // In-app file preview using QuickLook (PDFs, images, docs, etc.)
         .quickLookPreview($previewFileURL)
-        // Fullscreen code preview — triggered by eye button in code blocks
-        .onReceive(NotificationCenter.default.publisher(for: .markdownCodePreview)) { notification in
-            if let code = notification.userInfo?["code"] as? String {
-                codePreviewLanguage = notification.userInfo?["language"] as? String ?? ""
-                codePreviewCode = code
-            }
-        }
-        .sheet(item: $codePreviewCode) { code in
-            FullCodeView(code: code, language: codePreviewLanguage)
-        }
+        .applyWidgetAndPickerHandlers(
+            showCameraPicker: $showCameraPicker,
+            showPhotosPicker: $showPhotosPicker,
+            showFilePicker: $showFilePicker,
+            selectedPhotos: $selectedPhotos,
+            codePreviewCode: $codePreviewCode,
+            codePreviewLanguage: $codePreviewLanguage,
+            onDismissOverlays: { dismissAllPickers() }
+        )
     }
 
     // MARK: - Toolbar
@@ -557,6 +584,22 @@ struct ChatDetailView: View {
                     if viewModel.isShowingPromptPicker {
                         withAnimation(.easeOut(duration: 0.15)) {
                             viewModel.dismissPromptPicker()
+                        }
+                    }
+                },
+                onDollarTrigger: { query in
+                    viewModel.skillSearchQuery = query
+                    if !viewModel.isShowingSkillPicker {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            viewModel.isShowingSkillPicker = true
+                        }
+                        viewModel.loadSkills()
+                    }
+                },
+                onDollarDismiss: {
+                    if viewModel.isShowingSkillPicker {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.dismissSkillPicker()
                         }
                     }
                 },
@@ -923,6 +966,18 @@ struct ChatDetailView: View {
                 assistantActionBar(for: message)
                     .padding(.horizontal, Spacing.screenPadding)
                     .padding(.top, Spacing.xs)
+                    // Popover must live at the row level (not inside the ForEach action bar)
+                    // so that every message gets its own independent popover anchor.
+                    // Attaching it inside assistantActionBar (which is called inside ForEach)
+                    // causes SwiftUI to only register the last one.
+                    .popover(isPresented: Binding(
+                        get: { usagePopoverMessageId == message.id },
+                        set: { if !$0 { usagePopoverMessageId = nil } }
+                    ), arrowEdge: .bottom) {
+                        UsageInfoPopover(usage: message.usage ?? [:])
+                            .themed()
+                            .presentationCompactAdaptation(.popover)
+                    }
             }
 
             // ── User action bar (tap-revealed) ──
@@ -1058,8 +1113,7 @@ struct ChatDetailView: View {
 
                     // Text content
                     if !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text(message.content)
-                            .scaledFont(size: 15, context: .content)
+                        UserMessageContentView(content: message.content)
                             .lineSpacing(2)
                     }
                 }
@@ -1075,7 +1129,8 @@ struct ChatDetailView: View {
                 streamingStore: viewModel.streamingStore,
                 message: message,
                 activeVersionIndex: activeVersionIndex[message.id] ?? -1,
-                serverBaseURL: viewModel.serverBaseURL
+                serverBaseURL: viewModel.serverBaseURL,
+                authToken: viewModel.serverAuthToken
             )
         }
     }
@@ -1595,6 +1650,23 @@ struct ChatDetailView: View {
                 .accessibilityLabel("Delete version")
             }
 
+            // Usage info — shown whenever the server returned usage data on this message
+            if let usage = message.usage, !usage.isEmpty {
+                Button {
+                    withAnimation(MicroAnimation.snappy) {
+                        usagePopoverMessageId = usagePopoverMessageId == message.id ? nil : message.id
+                    }
+                    Haptics.play(.light)
+                } label: {
+                    compactActionIcon(
+                        icon: "info.circle",
+                        isActive: usagePopoverMessageId == message.id
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Token usage")
+            }
+
             Spacer()
         }
     }
@@ -1902,6 +1974,15 @@ struct ChatDetailView: View {
 
 
     // MARK: - Actions
+
+    /// Dismiss all picker/overlay states so a new quick action doesn't stack.
+    private func dismissAllPickers() {
+        showCameraPicker = false
+        showFilePicker = false
+        showPhotosPicker = false
+        showAudioPicker = false
+        showWebURLAlert = false
+    }
 
     private func toggleVoiceInput() {
         Haptics.play(.medium)
@@ -2223,6 +2304,8 @@ private struct IsolatedAssistantMessage: View {
     let message: ChatMessage
     let activeVersionIndex: Int
     let serverBaseURL: String
+    /// Auth token passed down to Rich UI embed webviews for localStorage injection.
+    var authToken: String? = nil
 
     var body: some View {
         let isActivelyStreaming = streamingStore.streamingMessageId == message.id
@@ -2255,7 +2338,10 @@ private struct IsolatedAssistantMessage: View {
         } else {
             AssistantMessageContent(
                 content: displayContent,
-                isStreaming: effectiveIsStreaming
+                isStreaming: effectiveIsStreaming,
+                messageEmbeds: message.embeds,
+                authToken: authToken,
+                serverBaseURL: serverBaseURL
             )
         }
     }
@@ -2330,6 +2416,152 @@ private func superscriptNumber(_ n: Int) -> String {
         guard let digit = c.wholeNumberValue, digit < superDigits.count else { return nil }
         return superDigits[digit]
     })
+}
+
+// MARK: - User Message Content View
+
+/// Renders a user message, parsing `<$slug|slug>` skill tags as inline
+/// styled chips and displaying the surrounding plain text normally.
+///
+/// The web UI stores skill references in message content as `<$slug|slug>`
+/// (e.g. `<$sde|sde>`). This view splits the content into alternating
+/// plain-text and skill-tag segments, then renders each chip with the
+/// same accent styling used in the input field's skill chips.
+struct UserMessageContentView: View {
+    let content: String
+    @Environment(\.theme) private var theme
+
+    /// Parses `content` into alternating text / skill segments.
+    /// Pattern: `<$slug|slug>` — captures the slug before `|`.
+    private var segments: [UserMessageContentView_SegmentType] {
+        let pattern = #"<\$([^|>]+)\|[^>]+>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return [.text(content)]
+        }
+        var result: [UserMessageContentView_SegmentType] = []
+        var searchStart = content.startIndex
+        let nsContent = content as NSString
+        let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsContent.length))
+
+        for match in matches {
+            guard let fullRange = Range(match.range, in: content),
+                  let slugRange = Range(match.range(at: 1), in: content) else { continue }
+            let prefix = String(content[searchStart..<fullRange.lowerBound])
+            if !prefix.isEmpty { result.append(.text(prefix)) }
+            result.append(.skill(slug: String(content[slugRange])))
+            searchStart = fullRange.upperBound
+        }
+        let suffix = String(content[searchStart...])
+        if !suffix.isEmpty { result.append(.text(suffix)) }
+        return result.isEmpty ? [.text(content)] : result
+    }
+
+    var body: some View {
+        let segs = segments
+        let hasChips = segs.contains { if case .skill = $0 { return true }; return false }
+
+        if !hasChips {
+            Text(content)
+                .scaledFont(size: 15, context: .content)
+        } else {
+            SkillTaggedTextView(segments: segs)
+        }
+    }
+}
+
+/// Renders a mix of text and skill chips in a flowing layout.
+/// Uses `Layout` to flow content left-to-right, wrapping as needed.
+private struct SkillTaggedTextView: View {
+    let segments: [UserMessageContentView_Segment]
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        // Build one or more lines. We use a simple VStack + HStack wrap
+        // by splitting on newlines first, then rendering each line's chips inline.
+        let lines = buildLines()
+        VStack(alignment: .trailing, spacing: 2) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                FlowRow(segments: line, theme: theme)
+            }
+        }
+    }
+
+    /// Splits segments into lines (splitting on newlines in text segments).
+    private func buildLines() -> [[UserMessageContentView_Segment]] {
+        var lines: [[UserMessageContentView_Segment]] = [[]]
+        for seg in segments {
+            switch seg {
+            case .skill:
+                lines[lines.count - 1].append(seg)
+            case .text(let str):
+                let parts = str.components(separatedBy: "\n")
+                for (i, part) in parts.enumerated() {
+                    if i > 0 { lines.append([]) }
+                    if !part.isEmpty {
+                        lines[lines.count - 1].append(.text(part))
+                    }
+                }
+            }
+        }
+        return lines.filter { !$0.isEmpty }
+    }
+}
+
+// Type alias to share the enum with SkillTaggedTextView
+private typealias UserMessageContentView_Segment = UserMessageContentView_SegmentType
+
+enum UserMessageContentView_SegmentType {
+    case text(String)
+    case skill(slug: String)
+}
+
+/// A single row of mixed text + skill chips, wrapping as needed.
+private struct FlowRow: View {
+    let segments: [UserMessageContentView_Segment]
+    let theme: AppTheme
+
+    var body: some View {
+        // Concatenate text and chip views in an HStack that wraps.
+        // We use ViewThatFits + LazyHStack fallback for wrapping behavior.
+        // For simplicity, render as a single HStack (most messages are short).
+        HStack(alignment: .center, spacing: 4) {
+            ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+                switch seg {
+                case .text(let str):
+                    Text(str)
+                        .scaledFont(size: 15, context: .content)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .skill(let slug):
+                    SkillChipView(slug: slug, theme: theme)
+                }
+            }
+        }
+    }
+}
+
+/// A single skill chip rendered in the user bubble.
+/// Styled as a small rounded badge matching the web UI's `$slug` pill.
+private struct SkillChipView: View {
+    let slug: String
+    let theme: AppTheme
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text("$")
+                .scaledFont(size: 12, weight: .bold)
+            Text(slug)
+                .scaledFont(size: 12, weight: .semibold)
+        }
+        .foregroundStyle(theme.chatBubbleUserText)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(theme.chatBubbleUserText.opacity(0.18))
+        .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .strokeBorder(theme.chatBubbleUserText.opacity(0.3), lineWidth: 0.5)
+        )
+    }
 }
 
 // MARK: - Prompt Card Button Style
@@ -2521,6 +2753,52 @@ private struct ScrollViewHorizontalLock: UIViewRepresentable {
             }
             return true
         }
+    }
+}
+
+// MARK: - Widget & Picker Notification Handlers (Type-Checker Relief)
+
+/// Extracted into a View extension to reduce the expression complexity of
+/// ChatDetailView.body, which was hitting the Swift type-checker limit.
+private extension View {
+    func applyWidgetAndPickerHandlers(
+        showCameraPicker: Binding<Bool>,
+        showPhotosPicker: Binding<Bool>,
+        showFilePicker: Binding<Bool>,
+        selectedPhotos: Binding<[PhotosPickerItem]>,
+        codePreviewCode: Binding<String?>,
+        codePreviewLanguage: Binding<String>,
+        onDismissOverlays: @escaping () -> Void
+    ) -> some View {
+        self
+            .onReceive(NotificationCenter.default.publisher(for: .markdownCodePreview)) { notification in
+                if let code = notification.userInfo?["code"] as? String {
+                    codePreviewLanguage.wrappedValue = notification.userInfo?["language"] as? String ?? ""
+                    codePreviewCode.wrappedValue = code
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUIDismissOverlays)) { _ in
+                onDismissOverlays()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUICameraChat)) { _ in
+                showCameraPicker.wrappedValue = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUIPhotosChat)) { _ in
+                showPhotosPicker.wrappedValue = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUIFileChat)) { _ in
+                showFilePicker.wrappedValue = true
+            }
+            .photosPicker(
+                isPresented: showPhotosPicker,
+                selection: selectedPhotos,
+                maxSelectionCount: 5,
+                matching: .images,
+                photoLibrary: .shared()
+            )
+            .sheet(item: codePreviewCode) { code in
+                FullCodeView(code: code, language: codePreviewLanguage.wrappedValue)
+            }
     }
 }
 

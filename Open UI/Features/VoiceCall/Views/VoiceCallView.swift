@@ -256,6 +256,17 @@ struct VoiceCallView: View {
 
             Spacer()
 
+            // Speaker toggle
+            compactControl(
+                icon: viewModel.isSpeakerOn ? "speaker.wave.3.fill" : "speaker.slash.fill",
+                isActive: viewModel.isSpeakerOn,
+                activeColor: .white.opacity(0.85)
+            ) {
+                viewModel.toggleSpeaker()
+            }
+
+            Spacer()
+
             // Voice / language settings
             compactControl(icon: "globe", isActive: false) {
                 showVoiceSettings = true

@@ -1,9 +1,62 @@
 import SwiftUI
 import WidgetKit
 import BackgroundTasks
+import UIKit
+
+// MARK: - App Delegate + Scene Delegate (handles home screen Quick Actions)
+//
+// In a scene-based SwiftUI app (UIApplicationSceneManifest_Generation = YES),
+// UIApplicationDelegate.performActionFor is NEVER called for shortcut items.
+// iOS routes them to the UIWindowSceneDelegate instead:
+//   • Cold launch  → scene(_:willConnectTo:options:)  (connectionOptions.shortcutItem)
+//   • Warm launch  → windowScene(_:performActionFor:completionHandler:)
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+
+    /// Pending shortcut action type string, set by the scene delegate.
+    /// Consumed by the `scenePhase == .active` handler in `Open_UIApp`.
+    static var pendingShortcutAction: String?
+
+    /// Return a scene configuration that uses our custom SceneDelegate.
+    func application(
+        _ application: UIApplication,
+        configurationForConnecting connectingSceneSession: UISceneSession,
+        options: UIScene.ConnectionOptions
+    ) -> UISceneConfiguration {
+        let config = UISceneConfiguration(name: nil, sessionRole: connectingSceneSession.role)
+        config.delegateClass = ShortcutSceneDelegate.self
+        return config
+    }
+}
+
+/// Scene delegate that intercepts shortcut items on both cold and warm launch.
+final class ShortcutSceneDelegate: UIResponder, UIWindowSceneDelegate {
+
+    /// **Cold launch**: shortcut item arrives in connectionOptions.
+    func scene(
+        _ scene: UIScene,
+        willConnectTo session: UISceneSession,
+        options connectionOptions: UIScene.ConnectionOptions
+    ) {
+        if let shortcutItem = connectionOptions.shortcutItem {
+            AppDelegate.pendingShortcutAction = shortcutItem.type
+        }
+    }
+
+    /// **Warm launch**: app already running / suspended when user taps a quick action.
+    func windowScene(
+        _ windowScene: UIWindowScene,
+        performActionFor shortcutItem: UIApplicationShortcutItem,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        AppDelegate.pendingShortcutAction = shortcutItem.type
+        completionHandler(true)
+    }
+}
 
 @main
 struct Open_UIApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var dependencies = AppDependencyContainer()
     @State private var router = AppRouter()
     @Environment(\.scenePhase) private var scenePhase
@@ -41,6 +94,25 @@ struct Open_UIApp: App {
                 .preferredColorScheme(dependencies.appearanceManager.resolvedColorScheme)
                 .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
                 .onChange(of: scenePhase) { _, newPhase in
+                    if newPhase == .active {
+                        // Process pending actions after a short delay so that
+                        // MainChatView / iPadMainChatView have time to mount
+                        // their .onReceive handlers before we post notifications.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            // 1. Quick Action from home screen long-press
+                            if let action = AppDelegate.pendingShortcutAction {
+                                AppDelegate.pendingShortcutAction = nil
+                                handleShortcutAction(action)
+                            }
+
+                            // 2. Control Center widget action (cross-process via UserDefaults)
+                            let defaults = UserDefaults(suiteName: SharedDataService.appGroupId)
+                            if let ccAction = defaults?.string(forKey: "pendingControlCenterAction") {
+                                defaults?.removeObject(forKey: "pendingControlCenterAction")
+                                handleControlCenterAction(ccAction)
+                            }
+                        }
+                    }
                     if newPhase == .inactive || newPhase == .background {
                         // Stop MarvisTTS and unload model before backgrounding to prevent
                         // Metal GPU crash (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted).
@@ -94,21 +166,6 @@ struct Open_UIApp: App {
                         handleDeepLink(url)
                     }
                 }
-                .onReceive(NotificationCenter.default.publisher(for: .openUINewChat)) { _ in
-                    router.navigate(to: .newChat)
-                }
-                .onReceive(NotificationCenter.default.publisher(for: .openUIVoiceCall)) { _ in
-                    router.presentSheet(.voiceCall(startNewConversation: true))
-                }
-                .onReceive(NotificationCenter.default.publisher(for: .openUIContinueConversation)) { notification in
-                    if let conversationId = notification.object as? String {
-                        router.navigate(to: .chatDetail(conversationId: conversationId))
-                    }
-                }
-                .onReceive(NotificationCenter.default.publisher(for: .openUICreateNote)) { notification in
-                    // Navigate to notes and create a new note
-                    router.navigate(to: .notesList)
-                }
         }
     }
 
@@ -146,20 +203,55 @@ struct Open_UIApp: App {
 
         switch host {
         case "new-chat":
-            router.navigate(to: .newChat)
+            // Widget "Ask Open Relay" bar → new chat with keyboard auto-focus.
+            // Posts a notification that MainChatView/iPadMainChatView handle directly
+            // (they own the activeConversationId state, not the router).
+            NotificationCenter.default.post(name: .openUINewChatWithFocus, object: nil)
             ShortcutDonationService.donateNewChat()
 
         case "voice-call":
-            router.presentSheet(.voiceCall(startNewConversation: true))
+            // Widget mic button → voice call. Posts a notification that
+            // MainChatView/iPadMainChatView handle by creating a VoiceCallViewModel
+            // and presenting it via router.presentVoiceCall(viewModel:).
+            NotificationCenter.default.post(name: .openUIWidgetVoiceCall, object: nil)
             ShortcutDonationService.donateVoiceCall()
 
         case "new-note":
             router.navigate(to: .notesList)
-            ShortcutDonationService.donateCreateNote()
 
         case "continue":
             if let conversationId = SharedDataService.shared.lastActiveConversationId {
                 router.navigate(to: .chatDetail(conversationId: conversationId))
+            }
+
+        case "camera-chat":
+            // Widget camera button → new chat + open camera immediately.
+            // Posts newChatWithFocus first (MainChatView/iPadMainChatView handle
+            // creating the new chat via local state), then after a delay posts
+            // the camera notification which ChatDetailView handles.
+            NotificationCenter.default.post(name: .openUINewChatWithFocus, object: nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                NotificationCenter.default.post(name: .openUICameraChat, object: nil)
+            }
+
+        case "photos-chat":
+            // Widget photos button → new chat + open photo picker immediately.
+            NotificationCenter.default.post(name: .openUINewChatWithFocus, object: nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                NotificationCenter.default.post(name: .openUIPhotosChat, object: nil)
+            }
+
+        case "file-chat":
+            // Widget files button → new chat + open file picker immediately.
+            NotificationCenter.default.post(name: .openUINewChatWithFocus, object: nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                NotificationCenter.default.post(name: .openUIFileChat, object: nil)
+            }
+
+        case "new-channel":
+            // Signal the main view to open the create-channel sheet
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                NotificationCenter.default.post(name: .openUINewChannel, object: nil)
             }
 
         case "chat":
@@ -185,6 +277,70 @@ struct Open_UIApp: App {
 
         default:
             break
+        }
+    }
+
+    // MARK: - Overlay Dismissal
+
+    /// Dismisses all presented overlays (camera, file picker, voice call, sheets, etc.)
+    /// before starting a new quick action so they don't stack on top of each other.
+    /// Posts a broadcast notification that ChatDetailView, MainChatView, and
+    /// iPadMainChatView each listen for to reset their local overlay booleans.
+    private func dismissAllOverlays() {
+        NotificationCenter.default.post(name: .openUIDismissOverlays, object: nil)
+        router.dismissVoiceCall()
+        router.dismissSheet()
+    }
+
+    // MARK: - Quick Action Handlers
+
+    /// Maps a `UIApplicationShortcutItemType` string (from Info.plist) to the
+    /// corresponding NotificationCenter post so MainChatView / iPadMainChatView
+    /// can react. Called from the `scenePhase == .active` handler after a delay.
+    private func handleShortcutAction(_ type: String) {
+        // Dismiss any existing overlays first so new action doesn't stack
+        dismissAllOverlays()
+
+        // Short delay to let SwiftUI animate the dismissal before presenting new overlay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            switch type {
+            case "com.openui.openui.new-chat":
+                NotificationCenter.default.post(name: .openUINewChatWithFocus, object: nil)
+                ShortcutDonationService.donateNewChat()
+
+            case "com.openui.openui.voice-call":
+                NotificationCenter.default.post(name: .openUIWidgetVoiceCall, object: nil)
+                ShortcutDonationService.donateVoiceCall()
+
+            case "com.openui.openui.camera-chat":
+                NotificationCenter.default.post(name: .openUINewChatWithFocus, object: nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    NotificationCenter.default.post(name: .openUICameraChat, object: nil)
+                }
+
+            case "com.openui.openui.new-channel":
+                NotificationCenter.default.post(name: .openUINewChannel, object: nil)
+
+            default:
+                break
+            }
+        }
+    }
+
+    /// Handles a pending action written to shared UserDefaults by the
+    /// Control Center widget extension (runs in a separate process).
+    private func handleControlCenterAction(_ action: String) {
+        // Dismiss any existing overlays first so new action doesn't stack
+        dismissAllOverlays()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            switch action {
+            case "new-chat":
+                NotificationCenter.default.post(name: .openUINewChatWithFocus, object: nil)
+                ShortcutDonationService.donateNewChat()
+            default:
+                break
+            }
         }
     }
 }

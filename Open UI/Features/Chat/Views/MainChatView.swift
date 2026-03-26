@@ -26,11 +26,23 @@ struct MainChatView: View {
     /// Controls the notes sheet presentation.
     @State private var showNotes = false
 
+    /// Controls the workspace sheet presentation.
+    @State private var showWorkspace = false
+
+    /// Controls the memories sheet presentation.
+    @State private var showMemories = false
+
     /// Controls the channels list sheet presentation.
     @State private var showChannels = false
     
     /// Controls the create channel sheet presentation.
     @State private var showCreateChannel = false
+
+    /// Controls the archived chats sheet presentation.
+    @State private var showArchivedChats = false
+
+    /// Controls the shared chats sheet presentation.
+    @State private var showSharedChats = false
 
     /// Channel list VM for sidebar display.
     @State private var channelListVM = ChannelListViewModel()
@@ -72,6 +84,11 @@ struct MainChatView: View {
 
     /// Whether the drawer "Chats" header is being targeted by a drag.
     @State private var drawerChatsDropActive: Bool = false
+
+    /// Top-level section collapse states (persisted across launches).
+    @AppStorage("sidebar_folders_expanded") private var foldersExpanded: Bool = true
+    @AppStorage("sidebar_channels_expanded") private var channelsExpanded: Bool = true
+    @AppStorage("sidebar_chats_expanded") private var chatsExpanded: Bool = true
 
     /// Cached container width from GeometryReader (avoids deprecated UIScreen.main).
     @State private var containerWidth: CGFloat = 360
@@ -595,6 +612,36 @@ struct MainChatView: View {
                     .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
                 }
             }
+            // Archived chats sheet
+            .sheet(isPresented: $showArchivedChats) {
+                ArchivedChatsView()
+                    .environment(dependencies)
+                    .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+            }
+            // Shared chats sheet
+            .sheet(isPresented: $showSharedChats) {
+                SharedChatsView()
+                    .environment(dependencies)
+                    .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+            }
+            // Workspace sheet
+            .sheet(isPresented: $showWorkspace) {
+                WorkspaceView()
+                    .environment(dependencies)
+                    .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+            }
+            // Memories sheet
+            .sheet(isPresented: $showMemories) {
+                NavigationStack {
+                    MemoriesView()
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button("Done") { showMemories = false }
+                            }
+                        }
+                }
+                .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+            }
     }
 
     // MARK: - Rename Conversation Sheet (extracted for readability)
@@ -841,6 +888,45 @@ struct MainChatView: View {
                     activeConversationId = nil
                     Haptics.play(.light)
                 }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUIDismissOverlays)) { _ in
+                // Quick action requested — dismiss any active sheet/cover so
+                // the new action doesn't stack on top of the old one.
+                showSettings = false
+                showNotes = false
+                showChannels = false
+                showCreateChannel = false
+                showCreateFolderSheet = false
+                showExportShareSheet = false
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUINewChannel)) { _ in
+                // Widget "Channel" button — open the create-channel sheet
+                showCreateChannel = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUINewChatWithFocus)) { _ in
+                // Widget "Ask Open Relay" bar — start new chat and auto-focus keyboard
+                startNewChat()
+                // Give the view time to settle before requesting keyboard focus
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    NotificationCenter.default.post(name: .chatInputFieldRequestFocus, object: nil)
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUIWidgetVoiceCall)) { _ in
+                // Widget mic button — start a voice call with full configuration
+                // (mirrors ChatDetailView's startVoiceCall pattern)
+                let voiceCallVM = dependencies.makeVoiceCallViewModel()
+                let chatVM = dependencies.activeChatStore.viewModel(for: nil)
+                if let manager = dependencies.conversationManager {
+                    let modelName = dependencies.activeChatStore.cachedModels
+                        .first(where: { $0.id == dependencies.activeChatStore.cachedSelectedModelId })?.name
+                        ?? "AI Assistant"
+                    voiceCallVM.configure(
+                        conversationManager: manager,
+                        chatViewModel: chatVM,
+                        modelName: modelName
+                    )
+                }
+                router.presentVoiceCall(viewModel: voiceCallVM)
             }
             .onReceive(NotificationCenter.default.publisher(for: .conversationListNeedsRefresh)) { _ in
                 Task {
@@ -1090,58 +1176,76 @@ struct MainChatView: View {
                     // ── CHANNELS SECTION (shown only when enabled on server) ──
                     if channelsEnabled {
                     VStack(alignment: .leading, spacing: 0) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "bubble.left.and.bubble.right")
-                                .scaledFont(size: 10, weight: .semibold)
-                                .foregroundStyle(theme.textTertiary)
-                            Text("Channels")
-                                .scaledFont(size: 12, weight: .medium)
-                                .fontWeight(.bold)
-                                .foregroundStyle(theme.textTertiary)
-                                .textCase(.uppercase)
-                                .tracking(0.5)
-                            Spacer()
-                            
-                            // Create new channel directly
-                            Button {
-                                closeDrawer()
-                                showCreateChannel = true
-                            } label: {
-                                Image(systemName: "plus.bubble")
+                        // Collapsible header
+                        Button {
+                            withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                                channelsExpanded.toggle()
+                            }
+                            Haptics.play(.light)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "chevron.down")
+                                    .scaledFont(size: 8, weight: .bold)
+                                    .foregroundStyle(theme.textTertiary)
+                                    .rotationEffect(.degrees(channelsExpanded ? 0 : -90))
+                                    .animation(.easeInOut(duration: AnimDuration.fast), value: channelsExpanded)
+
+                                Image(systemName: "bubble.left.and.bubble.right")
+                                    .scaledFont(size: 10, weight: .semibold)
+                                    .foregroundStyle(theme.textTertiary)
+                                Text("Channels")
+                                    .scaledFont(size: 12, weight: .medium)
+                                    .fontWeight(.bold)
+                                    .foregroundStyle(theme.textTertiary)
+                                    .textCase(.uppercase)
+                                    .tracking(0.5)
+                                Spacer()
+
+                                // Create new channel directly (always visible)
+                                Button {
+                                    closeDrawer()
+                                    showCreateChannel = true
+                                } label: {
+                                    Image(systemName: "plus.bubble")
+                                        .scaledFont(size: 13)
+                                        .foregroundStyle(theme.textTertiary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.horizontal, Spacing.md)
+                            .padding(.vertical, Spacing.sm)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        if channelsExpanded {
+                            if channelListVM.channels.isEmpty {
+                                Text("No channels yet")
                                     .scaledFont(size: 13)
                                     .foregroundStyle(theme.textTertiary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .padding(.horizontal, Spacing.md)
-                        .padding(.vertical, Spacing.sm)
-
-                        if channelListVM.channels.isEmpty {
-                            Text("No channels yet")
-                                .scaledFont(size: 13)
-                                .foregroundStyle(theme.textTertiary)
-                                .padding(.horizontal, Spacing.md)
-                                .padding(.vertical, 4)
-                        } else {
-                            // DMs first
-                            if !channelListVM.dmChannels.isEmpty {
-                                drawerChannelGroupLabel("Direct Messages", icon: "person.crop.circle")
-                                ForEach(channelListVM.dmChannels) { channel in
-                                    drawerChannelRow(channel)
+                                    .padding(.horizontal, Spacing.md)
+                                    .padding(.vertical, 4)
+                            } else {
+                                // DMs first
+                                if !channelListVM.dmChannels.isEmpty {
+                                    drawerChannelGroupLabel("Direct Messages", icon: "person.crop.circle")
+                                    ForEach(channelListVM.dmChannels) { channel in
+                                        drawerChannelRow(channel)
+                                    }
                                 }
-                            }
-                            // Groups
-                            if !channelListVM.groupChannels.isEmpty {
-                                drawerChannelGroupLabel("Groups", icon: "person.3")
-                                ForEach(channelListVM.groupChannels) { channel in
-                                    drawerChannelRow(channel)
+                                // Groups
+                                if !channelListVM.groupChannels.isEmpty {
+                                    drawerChannelGroupLabel("Groups", icon: "person.3")
+                                    ForEach(channelListVM.groupChannels) { channel in
+                                        drawerChannelRow(channel)
+                                    }
                                 }
-                            }
-                            // Standard channels
-                            if !channelListVM.standardChannels.isEmpty {
-                                drawerChannelGroupLabel("Channels", icon: "number")
-                                ForEach(channelListVM.standardChannels) { channel in
-                                    drawerChannelRow(channel)
+                                // Standard channels
+                                if !channelListVM.standardChannels.isEmpty {
+                                    drawerChannelGroupLabel("Channels", icon: "number")
+                                    ForEach(channelListVM.standardChannels) { channel in
+                                        drawerChannelRow(channel)
+                                    }
                                 }
                             }
                         }
@@ -1161,43 +1265,60 @@ struct MainChatView: View {
 
                     if hasAnyChats || !folderVM.folders.isEmpty {
                         VStack(alignment: .leading, spacing: 0) {
-                            // Header
-                            HStack(spacing: 6) {
-                                Image(systemName: "bubble.left.and.text.bubble.right")
-                                    .scaledFont(size: 10, weight: .semibold)
-                                    .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
-                                Text("Chats")
-                                    .scaledFont(size: 12, weight: .medium)
-                                    .fontWeight(.bold)
-                                    .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
-                                    .textCase(.uppercase)
-                                    .tracking(0.5)
-                                if drawerChatsDropActive {
-                                    Text("Drop here")
-                                        .scaledFont(size: 12, weight: .medium)
-                                        .foregroundStyle(theme.brandPrimary)
-                                        .transition(.opacity)
+                            // Collapsible header (also acts as drop zone indicator)
+                            Button {
+                                withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                                    chatsExpanded.toggle()
                                 }
-                                Spacer()
-                            }
-                            .padding(.horizontal, Spacing.md)
-                            .padding(.top, Spacing.sm)
-                            .padding(.bottom, Spacing.xs)
+                                Haptics.play(.light)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "chevron.down")
+                                        .scaledFont(size: 8, weight: .bold)
+                                        .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
+                                        .rotationEffect(.degrees(chatsExpanded ? 0 : -90))
+                                        .animation(.easeInOut(duration: AnimDuration.fast), value: chatsExpanded)
 
-                            // Pinned
-                            if !listViewModel.pinnedConversations.isEmpty {
-                                CollapsibleDrawerSection(title: "Pinned") {
-                                    ForEach(listViewModel.pinnedConversations) { conversation in
-                                        drawerConversationRow(conversation)
+                                    Image(systemName: "bubble.left.and.text.bubble.right")
+                                        .scaledFont(size: 10, weight: .semibold)
+                                        .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
+                                    Text("Chats")
+                                        .scaledFont(size: 12, weight: .medium)
+                                        .fontWeight(.bold)
+                                        .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
+                                        .textCase(.uppercase)
+                                        .tracking(0.5)
+                                    if drawerChatsDropActive {
+                                        Text("Drop here")
+                                            .scaledFont(size: 12, weight: .medium)
+                                            .foregroundStyle(theme.brandPrimary)
+                                            .transition(.opacity)
+                                    }
+                                    Spacer()
+                                }
+                                .padding(.horizontal, Spacing.md)
+                                .padding(.top, Spacing.sm)
+                                .padding(.bottom, Spacing.xs)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+
+                            if chatsExpanded {
+                                // Pinned
+                                if !listViewModel.pinnedConversations.isEmpty {
+                                    CollapsibleDrawerSection(title: "Pinned") {
+                                        ForEach(listViewModel.pinnedConversations) { conversation in
+                                            drawerConversationRow(conversation)
+                                        }
                                     }
                                 }
-                            }
 
-                            // Time-grouped
-                            ForEach(listViewModel.groupedConversations, id: \.0) { group in
-                                CollapsibleDrawerSection(title: group.0, count: group.1.count) {
-                                    ForEach(group.1) { conversation in
-                                        drawerConversationRow(conversation)
+                                // Time-grouped
+                                ForEach(listViewModel.groupedConversations, id: \.0) { group in
+                                    CollapsibleDrawerSection(title: group.0, count: group.1.count) {
+                                        ForEach(group.1) { conversation in
+                                            drawerConversationRow(conversation)
+                                        }
                                     }
                                 }
                             }
@@ -1345,6 +1466,22 @@ struct MainChatView: View {
                     } label: {
                         Label("Delete All Chats", systemImage: "trash")
                     }
+
+                    Divider()
+
+                    Button {
+                        closeDrawer()
+                        showArchivedChats = true
+                    } label: {
+                        Label("Archived Chats", systemImage: "archivebox")
+                    }
+
+                    Button {
+                        closeDrawer()
+                        showSharedChats = true
+                    } label: {
+                        Label("Shared Chats", systemImage: "link.circle")
+                    }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                         .scaledFont(size: 16, weight: .medium)
@@ -1426,94 +1563,100 @@ struct MainChatView: View {
     @ViewBuilder
     private func drawerFoldersSection(folderVM: FolderListViewModel) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Section header with "New Folder" button
-            HStack(spacing: 6) {
-                Image(systemName: "folder")
-                    .scaledFont(size: 10, weight: .semibold)
-                    .foregroundStyle(theme.textTertiary)
-
-                Text("Folders")
-                    .scaledFont(size: 12, weight: .medium)
-                    .fontWeight(.bold)
-                    .foregroundStyle(theme.textTertiary)
-                    .textCase(.uppercase)
-                    .tracking(0.5)
-
-                Spacer()
-
-                Button {
-                    showCreateFolderSheet = true
-                } label: {
-                    Image(systemName: "folder.badge.plus")
-                        .scaledFont(size: 13)
-                        .foregroundStyle(theme.textTertiary)
+            // Section header with collapse toggle + "New Folder" button
+            Button {
+                withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                    foldersExpanded.toggle()
                 }
-                .buttonStyle(.plain)
+                Haptics.play(.light)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.down")
+                        .scaledFont(size: 8, weight: .bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(foldersExpanded ? 0 : -90))
+                        .animation(.easeInOut(duration: AnimDuration.fast), value: foldersExpanded)
+
+                    Image(systemName: "folder")
+                        .scaledFont(size: 10, weight: .semibold)
+                        .foregroundStyle(theme.textTertiary)
+
+                    Text("Folders")
+                        .scaledFont(size: 12, weight: .medium)
+                        .fontWeight(.bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .textCase(.uppercase)
+                        .tracking(0.5)
+
+                    Spacer()
+
+                    Button {
+                        showCreateFolderSheet = true
+                    } label: {
+                        Image(systemName: "folder.badge.plus")
+                            .scaledFont(size: 13)
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, Spacing.sm)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, Spacing.md)
-            .padding(.vertical, Spacing.sm)
+            .buttonStyle(.plain)
 
             // Folder rows — use rootFolders (tree with childFolders populated)
-            ForEach(folderVM.rootFolders) { folder in
-                DrawerFolderRow(
-                    folder: folder,
-                    folderVM: folderVM,
-                    allConversations: listViewModel.conversations,
-                    activeConversationId: activeConversationId,
-                    activeFolderWorkspaceId: activeFolderWorkspaceId,
-                    onSelectChat: { chatId in
-                        activeConversationId = chatId
-                        activeFolderWorkspaceId = nil
-                        SharedDataService.shared.saveLastActiveConversationId(chatId)
-                        closeDrawer()
-                    },
-                    onSelectFolder: { folderId in
-                        Task { await folderVM.setActiveFolder(folderId) }
-                        // Reset the new-chat VM so the folder workspace always starts fresh.
-                        // Also increments newChatGeneration so the .id() on the folder-workspace
-                        // view changes — this forces onAppear to fire even when switching between
-                        // two different folders, ensuring setFolderContext is called with the
-                        // correct (sub)folder ID.
-                        dependencies.activeChatStore.remove(nil)
-                        newChatGeneration += 1
-                        activeFolderWorkspaceId = folderId
-                        activeConversationId = nil
-                        activeChannelId = nil
-                        closeDrawer()
-                    },
-                    onChatMoved: { chatId, targetFolderId in
-                        // Update the folderId in the main conversations list
-                        // so unfolderedConversations immediately excludes/includes it
-                        if let idx = listViewModel.conversations.firstIndex(where: { $0.id == chatId }) {
-                            listViewModel.conversations[idx].folderId = targetFolderId
-                        } else if targetFolderId == nil {
-                            // Chat was only in folder's chats array — add to main list
-                            let folderChats = folderVM.folders.flatMap(\.chats)
-                            if var conv = folderChats.first(where: { $0.id == chatId }) {
-                                conv.folderId = nil
-                                listViewModel.conversations.insert(conv, at: 0)
+            if foldersExpanded {
+                ForEach(folderVM.rootFolders) { folder in
+                    DrawerFolderRow(
+                        folder: folder,
+                        folderVM: folderVM,
+                        allConversations: listViewModel.conversations,
+                        activeConversationId: activeConversationId,
+                        activeFolderWorkspaceId: activeFolderWorkspaceId,
+                        onSelectChat: { chatId in
+                            activeConversationId = chatId
+                            activeFolderWorkspaceId = nil
+                            SharedDataService.shared.saveLastActiveConversationId(chatId)
+                            closeDrawer()
+                        },
+                        onSelectFolder: { folderId in
+                            Task { await folderVM.setActiveFolder(folderId) }
+                            dependencies.activeChatStore.remove(nil)
+                            newChatGeneration += 1
+                            activeFolderWorkspaceId = folderId
+                            activeConversationId = nil
+                            activeChannelId = nil
+                            closeDrawer()
+                        },
+                        onChatMoved: { chatId, targetFolderId in
+                            if let idx = listViewModel.conversations.firstIndex(where: { $0.id == chatId }) {
+                                listViewModel.conversations[idx].folderId = targetFolderId
+                            } else if targetFolderId == nil {
+                                let folderChats = folderVM.folders.flatMap(\.chats)
+                                if var conv = folderChats.first(where: { $0.id == chatId }) {
+                                    conv.folderId = nil
+                                    listViewModel.conversations.insert(conv, at: 0)
+                                }
                             }
+                        },
+                        onDeleteChat: { chatId in
+                            Task {
+                                await listViewModel.deleteConversation(id: chatId)
+                                for fIdx in folderVM.folders.indices {
+                                    folderVM.folders[fIdx].chats.removeAll { $0.id == chatId }
+                                }
+                                if activeConversationId == chatId {
+                                    activeConversationId = nil
+                                }
+                            }
+                        },
+                        onTogglePin: { conversation in
+                            Task { await listViewModel.togglePin(conversation: conversation) }
                         }
-                    },
-                    onDeleteChat: { chatId in
-                        Task {
-                            await listViewModel.deleteConversation(id: chatId)
-                            // Remove from whichever folder (root or subfolder) contains this chat.
-                            // Using `folder.id` here would only clear the root folder's list,
-                            // leaving subfolder chat lists stale until the drawer is reopened.
-                            for fIdx in folderVM.folders.indices {
-                                folderVM.folders[fIdx].chats.removeAll { $0.id == chatId }
-                            }
-                            if activeConversationId == chatId {
-                                activeConversationId = nil
-                            }
-                        }
-                    },
-                    onTogglePin: { conversation in
-                        Task { await listViewModel.togglePin(conversation: conversation) }
-                    }
-                )
-                .padding(.horizontal, Spacing.sm)
+                    )
+                    .padding(.horizontal, Spacing.sm)
+                }
             }
         }
         .animation(.easeInOut(duration: AnimDuration.medium), value: folderVM.folders.map(\.id))
@@ -1848,76 +1991,98 @@ struct MainChatView: View {
     // MARK: - Drawer Bottom Bar
 
     private var drawerBottomBar: some View {
-        HStack(spacing: Spacing.md) {
-            // User avatar + name
-            Button {
-                closeDrawer()
-                showSettings = true
-            } label: {
-                HStack(spacing: Spacing.sm) {
-                    UserAvatar(
-                        size: 32,
-                        imageURL: {
-                            guard let userId = dependencies.authViewModel.currentUser?.id,
-                                  let baseURL = dependencies.apiClient?.baseURL,
-                                  !userId.isEmpty, !baseURL.isEmpty else { return nil }
-                            return URL(string: "\(baseURL)/api/v1/users/\(userId)/profile/image")
-                        }(),
-                        name: dependencies.authViewModel.currentUser?.displayName ?? "User",
-                        authToken: dependencies.apiClient?.network.authToken
-                    )
+        VStack(spacing: 0) {
+            // Subtle top separator
+            Rectangle()
+                .fill(theme.textTertiary.opacity(0.12))
+                .frame(height: 0.5)
 
-                    Text(dependencies.authViewModel.currentUser?.displayName ?? "User")
-                        .scaledFont(size: 14, weight: .medium)
-                        .foregroundStyle(theme.textPrimary)
-                        .lineLimit(1)
-                }
-            }
-            .buttonStyle(.plain)
-
-            Spacer()
-
-            // New Chat
-            Button {
-                closeDrawer()
-                startNewChat()
-            } label: {
-                Image(systemName: "square.and.pencil")
-                    .scaledFont(size: 16, weight: .medium)
-                    .foregroundStyle(theme.textTertiary)
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-
-            // Notes (only shown when enabled on server)
-            if dependencies.authViewModel.backendConfig?.features?.enableNotes != false {
+            HStack(spacing: Spacing.sm) {
+                // User avatar + full name — taps to Settings/Profile
                 Button {
                     closeDrawer()
-                    showNotes = true
+                    showSettings = true
                 } label: {
-                    Image(systemName: "note.text")
+                    HStack(spacing: 10) {
+                        UserAvatar(
+                            size: 32,
+                            imageURL: {
+                                guard let userId = dependencies.authViewModel.currentUser?.id,
+                                      let baseURL = dependencies.apiClient?.baseURL,
+                                      !userId.isEmpty, !baseURL.isEmpty else { return nil }
+                                return URL(string: "\(baseURL)/api/v1/users/\(userId)/profile/image")
+                            }(),
+                            name: dependencies.authViewModel.currentUser?.displayName ?? "User",
+                            authToken: dependencies.apiClient?.network.authToken
+                        )
+
+                        Text(dependencies.authViewModel.currentUser?.displayName ?? "User")
+                            .scaledFont(size: 14, weight: .medium)
+                            .foregroundStyle(theme.textPrimary)
+                            .lineLimit(1)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+
+                // New Chat — primary action, always visible
+                Button {
+                    closeDrawer()
+                    startNewChat()
+                } label: {
+                    Image(systemName: "square.and.pencil")
                         .scaledFont(size: 16, weight: .medium)
-                        .foregroundStyle(theme.textTertiary)
-                        .frame(width: 44, height: 44)
+                        .foregroundStyle(theme.textSecondary)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("New Chat")
+
+                // More menu — secondary actions tucked away cleanly
+                Menu {
+                    Button {
+                        closeDrawer()
+                        showMemories = true
+                    } label: {
+                        Label("Memories", systemImage: "brain.head.profile")
+                    }
+                    Button {
+                        showWorkspace = true
+                    } label: {
+                        Label("Workspace", systemImage: "square.grid.2x2")
+                    }
+
+                    if dependencies.authViewModel.backendConfig?.features?.enableNotes != false {
+                        Button {
+                            closeDrawer()
+                            showNotes = true
+                        } label: {
+                            Label("Notes", systemImage: "note.text")
+                        }
+                    }
+
+                    Divider()
+
+                    Button {
+                        closeDrawer()
+                        showSettings = true
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .scaledFont(size: 18, weight: .medium)
+                        .foregroundStyle(theme.textSecondary)
+                        .frame(width: 40, height: 40)
                         .contentShape(Rectangle())
                 }
             }
-
-            // Settings
-            Button {
-                closeDrawer()
-                showSettings = true
-            } label: {
-                Image(systemName: "gearshape")
-                    .scaledFont(size: 16, weight: .medium)
-                    .foregroundStyle(theme.textTertiary)
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
+            .padding(.horizontal, Spacing.md)
+            .padding(.vertical, 10)
         }
-        .padding(.horizontal, Spacing.md)
-        .padding(.vertical, Spacing.sm)
-        .background(theme.surfaceContainer.opacity(0.3))
+        .background(theme.background)
     }
 
     // MARK: - Title Generation

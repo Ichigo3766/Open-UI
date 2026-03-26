@@ -320,6 +320,46 @@ final class NetworkManager: NSObject, Sendable {
         return json
     }
 
+    func requestJSONArray(
+        path: String,
+        method: HTTPMethod = .get,
+        queryItems: [URLQueryItem]? = nil,
+        body: [String: Any]? = nil,
+        authenticated: Bool = true,
+        timeout: TimeInterval? = nil
+    ) async throws -> [[String: Any]] {
+        let bodyData: Data?
+        if let body {
+            bodyData = try JSONSerialization.data(withJSONObject: body)
+        } else {
+            bodyData = nil
+        }
+
+        let urlRequest = try buildRequest(
+            path: path,
+            method: method,
+            queryItems: queryItems,
+            body: bodyData,
+            authenticated: authenticated,
+            timeout: timeout
+        )
+
+        let (data, response) = try await performRequest(urlRequest)
+        try validateHTTPResponse(response, data: data)
+
+        guard let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw APIError.responseDecoding(
+                underlying: NSError(
+                    domain: "APIError",
+                    code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Expected JSON array"]
+                ),
+                data: data
+            )
+        }
+        return arr
+    }
+
     // MARK: - Streaming (SSE)
 
     /// Opens an SSE streaming connection. Uses a dedicated session with extended timeouts

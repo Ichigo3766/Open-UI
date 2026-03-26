@@ -242,6 +242,12 @@ struct ChatCompletionRequest: Sendable {
     var sessionId: String?
     var messageId: String?
     var parentId: String?
+    /// When `true`, this request targets a pipe/function model.
+    /// Pipe models must NOT send `session_id`, `chat_id`, or `id` — their
+    /// presence together triggers the Redis async-task queue (~60s delay).
+    /// Pipe model responses are streamed directly from the HTTP response body.
+    var isPipeModel: Bool = false
+    var skillIds: [String]?
     var toolIds: [String]?
     var filterIds: [String]?
     var features: ChatFeatures?
@@ -257,6 +263,17 @@ struct ChatCompletionRequest: Sendable {
     /// to the LLM. Key use: `function_calling` — controls native vs default tool mode.
     /// Example: `["function_calling": "native"]` enables native tool calling.
     var params: [String: Any]?
+    /// Template variables (e.g. `{{USER_NAME}}`) resolved before the request is
+    /// forwarded to the LLM. Always sent as an object (empty `{}` when no vars),
+    /// matching web-client behaviour. Required for pipe model compatibility.
+    var variables: [String: Any]?
+    /// Full model JSON from the server. Sent as `model_item` so the backend can
+    /// route the request to the correct pipe function. Required for pipe models;
+    /// should be sent for ALL models so the backend has full routing context.
+    var modelItem: [String: Any]?
+    /// Tool server configurations. Always sent as an array (empty `[]` when none),
+    /// matching web-client behaviour. Required for pipe model compatibility.
+    var toolServers: [[String: Any]]?
 
     struct ChatFeatures: Sendable {
         var webSearch: Bool = false
@@ -279,42 +296,62 @@ struct ChatCompletionRequest: Sendable {
             "messages": messages
         ]
 
-        if let chatId { data["chat_id"] = chatId }
-        if let sessionId { data["session_id"] = sessionId }
-        if let messageId { data["id"] = messageId }
+        // Pipe models must NOT send session_id, chat_id, or id together —
+        // their combined presence triggers the Redis async-task queue (~60s delay).
+        // Pipe responses arrive directly in the HTTP response body as SSE.
+        if !isPipeModel {
+            if let chatId { data["chat_id"] = chatId }
+            if let sessionId { data["session_id"] = sessionId }
+            if let messageId { data["id"] = messageId }
+        }
         if let parentId { data["parent_id"] = parentId }
+        if let skillIds, !skillIds.isEmpty { data["skill_ids"] = skillIds }
         if let toolIds, !toolIds.isEmpty { data["tool_ids"] = toolIds }
         if let filterIds, !filterIds.isEmpty { data["filter_ids"] = filterIds }
         if let files, !files.isEmpty { data["files"] = files }
         if let streamOptions { data["stream_options"] = streamOptions }
-        if let backgroundTasks, !backgroundTasks.isEmpty { data["background_tasks"] = backgroundTasks }
         if let terminalId, !terminalId.isEmpty { data["terminal_id"] = terminalId }
-
-        // Include server-side params (e.g. function_calling mode).
-        // The server's apply_params_to_form_data() consumes this dict and strips
-        // OpenWebUI-specific keys before forwarding the rest to the LLM.
-        if let params, !params.isEmpty { data["params"] = params }
 
         // Always include parent_message to prevent server NoneType errors
         // (matches Flutter: data['parent_message'] = {})
         data["parent_message"] = [String: Any]()
 
-        if let features {
-            // Always send all feature keys with explicit true/false values,
-            // matching the web client behavior. If we only send `true` keys
-            // (or omit `features` entirely when all are off), the server falls
-            // back to the model's `defaultFeatureIds` and enables features the
-            // user explicitly toggled OFF.
-            var feat: [String: Any] = [:]
-            feat["web_search"] = features.webSearch
-            feat["image_generation"] = features.imageGeneration
-            feat["code_interpreter"] = features.codeInterpreter
-            // Always send memory explicitly (true/false) so the server never
-            // falls back to model defaults. Matches web client behavior where
-            // memory is sent based purely on the user's account setting.
-            feat["memory"] = features.memory
-            data["features"] = feat
-        }
+        // --- Pipe model compatibility fields ---
+        // These MUST always be sent as their empty equivalents when absent so
+        // the OpenWebUI pipe function receives a consistent request shape.
+        // Omitting them causes the backend to route through the Redis async-task
+        // queue (requires session_id + chat_id + id all present) which hangs ~60s.
+
+        // params: always send (empty {} when nil/empty)
+        data["params"] = params ?? [String: Any]()
+
+        // background_tasks: always send (empty {} when nil/empty)
+        data["background_tasks"] = backgroundTasks ?? [String: Any]()
+
+        // tool_servers: always send (empty [] when nil/empty)
+        data["tool_servers"] = toolServers ?? [[String: Any]]()
+
+        // variables: always send (empty {} when nil/empty)
+        data["variables"] = variables ?? [String: Any]()
+
+        // model_item: send when available (critical for pipe routing)
+        if let modelItem { data["model_item"] = modelItem }
+
+        // Always send all feature keys with explicit true/false values,
+        // matching the web client behavior. If we only send `true` keys
+        // (or omit `features` entirely when all are off), the server falls
+        // back to the model's `defaultFeatureIds` and enables features the
+        // user explicitly toggled OFF.
+        var feat: [String: Any] = [:]
+        let f = features ?? ChatFeatures()
+        feat["web_search"] = f.webSearch
+        feat["image_generation"] = f.imageGeneration
+        feat["code_interpreter"] = f.codeInterpreter
+        // Always send memory explicitly (true/false) so the server never
+        // falls back to model defaults. Matches web client behavior where
+        // memory is sent based purely on the user's account setting.
+        feat["memory"] = f.memory
+        data["features"] = feat
 
         return data
     }

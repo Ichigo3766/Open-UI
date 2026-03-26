@@ -30,6 +30,20 @@ struct AIModel: Codable, Identifiable, Hashable, Sendable {
     /// The connection type for this model (e.g. `"external"`, `"internal"`).
     /// Sourced from `connection_type` in the OpenWebUI model payload.
     var connectionType: String?
+    /// Whether this is a pipe/function model.
+    /// Pipe models require `model_item` + `params`/`tool_servers`/`features`/`variables`
+    /// to be sent unconditionally in every request — even when empty — so the backend
+    /// pipe function can route the request correctly. Without these fields the backend
+    /// hangs waiting for a Redis async task that never completes (~60s timeout).
+    var isPipeModel: Bool
+    /// Filter IDs associated with this model. Extracted from `filters[*].id` in the
+    /// OpenWebUI model payload. Sent as `filter_ids` in chat completion requests so
+    /// the backend runs the correct filter pipeline for this model.
+    var filterIds: [String]
+    /// The full raw model JSON from the server. Sent as `model_item` in chat completion
+    /// requests for pipe models so the backend can route to the correct pipe function.
+    /// Stored as `[String: Any]` (non-Codable) and excluded from Codable synthesis.
+    var rawModelItem: [String: Any]?
 
     init(
         id: String,
@@ -46,7 +60,10 @@ struct AIModel: Codable, Identifiable, Hashable, Sendable {
         functionCallingMode: String? = nil,
         builtinTools: [String: Bool] = [:],
         tags: [String] = [],
-        connectionType: String? = nil
+        connectionType: String? = nil,
+        isPipeModel: Bool = false,
+        filterIds: [String] = [],
+        rawModelItem: [String: Any]? = nil
     ) {
         self.id = id
         self.name = name
@@ -63,6 +80,9 @@ struct AIModel: Codable, Identifiable, Hashable, Sendable {
         self.builtinTools = builtinTools
         self.tags = tags
         self.connectionType = connectionType
+        self.isPipeModel = isPipeModel
+        self.filterIds = filterIds
+        self.rawModelItem = rawModelItem
     }
 
     /// Whether the memory builtin tool is enabled for this model.
@@ -76,6 +96,39 @@ struct AIModel: Codable, Identifiable, Hashable, Sendable {
             return String(name[name.index(after: lastSlash)...])
         }
         return name
+    }
+
+    // MARK: - Hashable & Equatable (rawModelItem excluded — [String: Any] is not Hashable)
+
+    static func == (lhs: AIModel, rhs: AIModel) -> Bool {
+        lhs.id == rhs.id
+            && lhs.name == rhs.name
+            && lhs.isPipeModel == rhs.isPipeModel
+            && lhs.filterIds == rhs.filterIds
+            && lhs.functionCallingMode == rhs.functionCallingMode
+            && lhs.toolIds == rhs.toolIds
+            && lhs.defaultFeatureIds == rhs.defaultFeatureIds
+            && lhs.capabilities == rhs.capabilities
+            && lhs.builtinTools == rhs.builtinTools
+            && lhs.tags == rhs.tags
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(name)
+        hasher.combine(isPipeModel)
+        hasher.combine(filterIds)
+    }
+
+    // MARK: - Codable (rawModelItem excluded — [String: Any] is not Codable)
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, description, isMultimodal, supportsStreaming, supportsRAG
+        case contextLength, capabilities, profileImageURL, toolIds, defaultFeatureIds
+        case functionCallingMode, builtinTools, tags, connectionType, isPipeModel, filterIds
+        // rawModelItem is intentionally excluded from Codable — it contains
+        // [String: Any] which cannot be synthesised. It is populated at runtime
+        // from the live model fetch and does not need persistence.
     }
 
     // MARK: - Avatar URL Resolution

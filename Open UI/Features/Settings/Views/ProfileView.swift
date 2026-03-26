@@ -190,7 +190,8 @@ struct ProfileView: View {
             UserAvatar(
                 size: 88,
                 imageURL: profileImageURL,
-                name: user?.displayName
+                name: user?.displayName,
+                authToken: dependencies.apiClient?.network.authToken
             )
 
             VStack(spacing: Spacing.xs) {
@@ -217,11 +218,10 @@ struct ProfileView: View {
     }
 
     private var profileImageURL: URL? {
-        guard let urlString = user?.profileImageURL, !urlString.isEmpty else { return nil }
-        if urlString.hasPrefix("http") {
-            return URL(string: urlString)
-        }
-        return URL(string: "\(viewModel.serverURL)\(urlString)")
+        guard let userId = user?.id,
+              let baseURL = dependencies.apiClient?.baseURL,
+              !userId.isEmpty, !baseURL.isEmpty else { return nil }
+        return URL(string: "\(baseURL)/api/v1/users/\(userId)/profile/image")
     }
 
     private func infoRow(

@@ -1,12 +1,29 @@
 # Changelog
 
-## 📦 NEXT BUILD
+## v2.0.0 — March 26, 2026
 
 ### What's New
+- Workspace Management - Introducing workspace access directly form the app. Control your models, knowledge, Prompts, skills, and Tools directly from the app. 
+- Skills - Type '$' in chat to browse and apply your skills. 
+- Added Archived Chats browser — tap the ⋯ menu in the chat list to open list of all your archived chats. Restore individual chats or unarchive everything at once.
+- Added Shared Chats manager — tap the ⋯ menu in the chat list to view all your currently shared chats, copy their share links, or revoke access for any shared conversation.
+- Added Rich UI embed support — tools that return interactive HTML (audio (Ace Step Music), video, cards, SMS composers, dashboards, charts, forms, and more) now render inline in the chat as live, interactive webviews.
+- Added token usage popover — tap the ⓘ info icon in the assistant action bar to see per-message token stats.
+- Home screen widgets and Shortcuts support - Start your chat from the widgets or directly from your action button using shortcuts.
 
 ### Improvements
+- Folders, Channels, and Chats sidebar sections are now collapsible
+- Server-side TTS now supports selecting a voice from your OpenWebUI server's available voices in Settings → Text-to-Speech.
+- Server-side STT now fully works for live microphone input and voice calls
+- Voice calls with AI now default to loudspeaker and include a speaker toggle button so you can switch between speaker and earpiece during a call.
+- Reading messages aloud in chat now plays through the loudspeaker instead of the earpiece.
+- Added Landscape mode for iPhone
+- Allow closing Terminal File browser drawer while still having terminal enabled on ipad and ios landscape mode. 
 
 ### Bug Fixes
+- Fixed pipe/function models (e.g. OpenRouter Pipe) hanging for ~60 seconds before responding
+- Fixed multiple bugs related to STT and TTS pipeline.
+- Fixed profile picture not loading in settings. 
 
 ## Previous Builds
 

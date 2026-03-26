@@ -23,6 +23,13 @@ final class FileAttachmentService {
     private let logger = Logger(subsystem: "com.openui", category: "FileAttachment")
     private var conversationManager: ConversationManager?
 
+    private struct FileEntry {
+        let id: UUID
+        let url: URL
+        let data: Data
+        let isImage: Bool
+    }
+
     // MARK: - Configuration
 
     func configure(with manager: ConversationManager) {
@@ -121,9 +128,177 @@ final class FileAttachmentService {
     }
 
     /// Processes multiple file URLs.
+    /// When 2 or more non-image files are selected they are uploaded in parallel
+    /// and then submitted to the server as a single batch-processing request,
+    /// which is faster than N individual upload+SSE-poll calls.
     func processFileURLs(_ urls: [URL]) async {
+        guard urls.count > 1 else {
+            // Single file — use the existing path (upload + SSE poll).
+            if let url = urls.first { await processFileURL(url) }
+            return
+        }
+
+        isProcessing = true
+        defer { isProcessing = false }
+
+        // ── 1. Read file data and classify URLs ───────────────────────────────
+        // Build FileEntry + add placeholder attachment in one pass so the
+        // entry.id always matches the attachment's auto-generated UUID.
+        var entries: [FileEntry] = []
         for url in urls {
-            await processFileURL(url)
+            guard url.startAccessingSecurityScopedResource() else {
+                logger.error("Cannot access security-scoped resource: \(url.path)")
+                continue
+            }
+            defer { url.stopAccessingSecurityScopedResource() }
+
+            guard let data = try? Data(contentsOf: url) else {
+                logger.error("Failed to read file data: \(url.path)")
+                continue
+            }
+            let isImage = UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) ?? false
+
+            // ── 2. Add placeholder attachment and capture its UUID ────────────
+            var attachment: ChatAttachment
+            if isImage {
+                let (convertedData, fileName) = convertToJPEGIfNeeded(
+                    data: data,
+                    originalName: url.lastPathComponent
+                )
+                let thumbnail: Image? = UIImage(data: convertedData).map { Image(uiImage: $0) }
+                attachment = ChatAttachment(
+                    type: .image,
+                    name: fileName,
+                    thumbnail: thumbnail,
+                    data: convertedData
+                )
+                attachment.uploadStatus = .uploading
+                pendingAttachments.append(attachment)
+                entries.append(FileEntry(id: attachment.id, url: url, data: convertedData, isImage: true))
+            } else {
+                attachment = ChatAttachment(
+                    type: .file,
+                    name: url.lastPathComponent,
+                    thumbnail: nil,
+                    data: data
+                )
+                attachment.uploadStatus = .uploading
+                pendingAttachments.append(attachment)
+                entries.append(FileEntry(id: attachment.id, url: url, data: data, isImage: false))
+            }
+        }
+
+        // ── 3. Images: upload individually (no server-side processing needed) ─
+        let imageEntries = entries.filter { $0.isImage }
+        let docEntries   = entries.filter { !$0.isImage }
+
+        for entry in imageEntries {
+            Task { await self.uploadAttachment(id: entry.id) }
+        }
+
+        // ── 4. Documents: single file → existing path; 2+ → batch ────────────
+        if docEntries.count == 1 {
+            Task { await self.uploadAttachment(id: docEntries[0].id) }
+        } else if docEntries.count > 1 {
+            Task { await self.uploadAndBatchProcess(entries: docEntries) }
+        }
+    }
+
+    // MARK: - Batch Upload + Process
+
+    /// Uploads each document without individual processing, then calls the
+    /// batch-processing endpoint once for all of them.
+    private func uploadAndBatchProcess(entries: [FileEntry]) async {
+        guard let manager = conversationManager else {
+            for entry in entries {
+                updateAttachmentStatus(id: entry.id, status: .error, error: "Not connected to server")
+            }
+            return
+        }
+
+        // ── Phase 1: parallel upload (no processing) ─────────────────────────
+        // Each element: (attachmentId, fileObject) or nil on failure
+        typealias UploadResult = (id: UUID, fileObject: [String: Any])?
+
+        var fileObjects: [[String: Any]] = []
+        var idToFileId: [UUID: String] = [:]
+
+        await withTaskGroup(of: UploadResult.self) { group in
+            for entry in entries {
+                let entryId = entry.id
+                let entryData = entry.data
+                let entryName = entry.url.lastPathComponent
+                group.addTask {
+                    do {
+                        let fileObj = try await manager.uploadFileOnly(
+                            data: entryData,
+                            fileName: entryName
+                        )
+                        return (id: entryId, fileObject: fileObj)
+                    } catch {
+                        let msg = (error as? APIError).flatMap {
+                            if case .httpError(_, let m, _) = $0 { return m } else { return nil }
+                        } ?? error.localizedDescription
+                        await MainActor.run {
+                            self.updateAttachmentStatus(id: entryId, status: .error, error: msg)
+                        }
+                        self.logger.error("Batch upload failed for \(entryName): \(msg)")
+                        return nil
+                    }
+                }
+            }
+
+            for await result in group {
+                guard let r = result else { continue }
+                fileObjects.append(r.fileObject)
+                if let fileId = r.fileObject["id"] as? String {
+                    idToFileId[r.id] = fileId
+                }
+            }
+        }
+
+        // Mark all successfully uploaded files as .processing
+        for (attachId, _) in idToFileId {
+            updateAttachmentStatus(id: attachId, status: .processing)
+        }
+
+        guard !fileObjects.isEmpty else { return }
+
+        // ── Phase 2: single batch-process call ────────────────────────────────
+        let collectionName = "batch-\(UUID().uuidString)"
+        do {
+            let result = try await manager.processFilesBatch(
+                fileObjects: fileObjects,
+                collectionName: collectionName
+            )
+
+            // Map fileId → attachmentId for result routing
+            let fileIdToAttachId = Dictionary(uniqueKeysWithValues: idToFileId.map { ($1, $0) })
+
+            for fileId in result.successes {
+                if let attachId = fileIdToAttachId[fileId] {
+                    updateAttachmentStatus(id: attachId, status: .completed, fileId: fileId)
+                }
+            }
+            for failure in result.errors {
+                if let attachId = fileIdToAttachId[failure.fileId] {
+                    updateAttachmentStatus(
+                        id: attachId,
+                        status: .error,
+                        error: failure.error ?? "Processing failed"
+                    )
+                }
+            }
+            logger.info("Batch processed \(result.successes.count) files (\(result.errors.count) errors)")
+        } catch {
+            let msg = (error as? APIError).flatMap {
+                if case .httpError(_, let m, _) = $0 { return m } else { return nil }
+            } ?? error.localizedDescription
+            logger.error("Batch processing call failed: \(msg)")
+            // Fall back: mark each as error with the batch failure message
+            for attachId in idToFileId.keys {
+                updateAttachmentStatus(id: attachId, status: .error, error: msg)
+            }
         }
     }
 

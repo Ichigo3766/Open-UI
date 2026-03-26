@@ -222,6 +222,24 @@ struct AccessGrant: Identifiable, Hashable, Sendable {
         
         return AccessGrant(id: id, userId: userId, groupId: groupId, read: read, write: write)
     }
+
+    /// Merges a flat list of access grant entries into one `AccessGrant` per user.
+    /// The server uses two entries (one "read" + one "write") to represent write access.
+    /// This collapses them: a user gets `write = true` if ANY entry has permission "write".
+    static func mergedByUser(_ grants: [AccessGrant]) -> [AccessGrant] {
+        var byUser: [String: AccessGrant] = [:]
+        for grant in grants {
+            guard let uid = grant.userId else { continue }
+            if let existing = byUser[uid] {
+                if grant.write && !existing.write {
+                    byUser[uid] = AccessGrant(id: existing.id, userId: uid, groupId: existing.groupId, read: true, write: true)
+                }
+            } else {
+                byUser[uid] = grant
+            }
+        }
+        return Array(byUser.values)
+    }
 }
 
 // MARK: - Channel Member

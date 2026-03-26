@@ -103,6 +103,19 @@ final class ChatViewModel {
     var promptSearchQuery: String = ""
     /// Whether prompts are currently being loaded from the server.
     var isLoadingPrompts: Bool = false
+    // Skill $ trigger state
+    /// Cached skills from the server. Fetched lazily on first `$` trigger.
+    var availableSkills: [SkillItem] = []
+    /// Whether the skill picker overlay is visible.
+    var isShowingSkillPicker: Bool = false
+    /// The current filter query (text typed after `$`).
+    var skillSearchQuery: String = ""
+    /// Whether skills are currently being loaded from the server.
+    var isLoadingSkills: Bool = false
+    /// Skills selected via the `$` picker for the current message.
+    /// Sent as `skill_ids` in the API request and cleared after each send.
+    var selectedSkillIds: [String] = []
+
     /// The prompt selected by the user that has variables requiring input.
     /// When set, the variable input sheet is presented.
     var pendingPromptForVariables: PromptItem?
@@ -809,6 +822,16 @@ final class ChatViewModel {
                 if mergedVersions.count != local.versions.count || mergedVersions != local.versions {
                     conversation!.messages[localIdx].versions = mergedVersions
                 }
+
+                // Preserve usage data from server — never overwrite with nil
+                if local.usage == nil,
+                   let serverUsage = serverMsg.usage, !serverUsage.isEmpty {
+                    conversation!.messages[localIdx].usage = serverUsage
+                }
+                // Preserve embeds from server — never overwrite non-empty embeds with empty
+                if local.embeds.isEmpty && !serverMsg.embeds.isEmpty {
+                    conversation!.messages[localIdx].embeds = serverMsg.embeds
+                }
             } else {
                 // New message from server — insert at correct position
                 let insertIdx = min(serverIdx, conversation!.messages.count)
@@ -1428,6 +1451,90 @@ final class ChatViewModel {
         promptSearchQuery = ""
     }
 
+    // MARK: - Skills Dollar Commands
+
+    /// Fetches active skills from the server for the `$` picker.
+    ///
+    /// Uses a **stale-while-revalidate** strategy like prompts:
+    /// - If cache exists, shows it instantly and refreshes in the background.
+    /// - If no cache, shows a loading state while fetching.
+    func loadSkills() {
+        if !availableSkills.isEmpty {
+            // Background refresh — no loading indicator
+            Task { await fetchSkillsFromServer() }
+            return
+        }
+
+        // No cache — show loading state
+        isLoadingSkills = true
+        Task {
+            await fetchSkillsFromServer()
+            isLoadingSkills = false
+        }
+    }
+
+    /// Fetches skills from the server API.
+    private func fetchSkillsFromServer() async {
+        guard let apiClient = manager?.apiClient else { return }
+        do {
+            let items = try await apiClient.getSkills()
+            // Only cache active skills — disabled skills don't appear in $ commands
+            availableSkills = items.filter(\.isActive)
+            logger.info("Loaded \(self.availableSkills.count) active skills")
+        } catch {
+            logger.warning("Failed to load skills: \(error.localizedDescription)")
+        }
+    }
+
+    /// Called when the user selects a skill from the `$` picker.
+    ///
+    /// Replaces the `$query` token with `<$slug|slug> ` in the input text
+    /// (matching the Open WebUI wire format), and records the skill ID in
+    /// `selectedSkillIds` so it is sent as `skill_ids` in the API request.
+    func selectSkill(_ skill: SkillItem) {
+        // Use the web UI format: <$slug|slug>
+        replaceDollarTokenWith("<$\(skill.id)|\(skill.id)> ")
+        dismissSkillPicker()
+
+        if !selectedSkillIds.contains(skill.id) {
+            selectedSkillIds.append(skill.id)
+        }
+
+        Haptics.play(.light)
+    }
+
+    /// Replaces the `$...` token in the input text with `replacement`.
+    /// The token is the text from the last bare `$` (at start or preceded by
+    /// whitespace) up to the next whitespace or end of string.
+    private func replaceDollarTokenWith(_ replacement: String) {
+        let text = inputText
+        guard let dollarIndex = text.lastIndex(of: "$") else { return }
+        let dollarPos = text.distance(from: text.startIndex, to: dollarIndex)
+        let isAtStart = dollarPos == 0
+        let precededBySpace = dollarPos > 0 && {
+            let beforeIdx = text.index(before: dollarIndex)
+            return text[beforeIdx].isWhitespace || text[beforeIdx].isNewline
+        }()
+
+        if isAtStart || precededBySpace {
+            let afterDollar = text[dollarIndex...]
+            let tokenEnd = afterDollar.firstIndex(where: { $0.isWhitespace || $0.isNewline }) ?? text.endIndex
+            let newText = String(text[text.startIndex..<dollarIndex]) + replacement + String(text[tokenEnd...])
+            inputText = newText
+        }
+    }
+
+    /// Removes the `$...` token from the input text (replaces with empty string).
+    private func removeDollarToken() {
+        replaceDollarTokenWith("")
+    }
+
+    /// Dismisses the skill picker popup.
+    func dismissSkillPicker() {
+        isShowingSkillPicker = false
+        skillSearchQuery = ""
+    }
+
     /// Restores `selectedKnowledgeItems` from the conversation's user messages.
     ///
     /// When loading an existing conversation, scans user messages for files
@@ -1863,6 +1970,7 @@ final class ChatViewModel {
         userDisabledToolIds = []
         selectedToolIds = []
         selectedKnowledgeItems = []
+        selectedSkillIds = []
         // Sync UI toggles with the selected model's server-configured defaults.
         syncUIWithModelDefaults()
     }
@@ -1941,6 +2049,10 @@ final class ChatViewModel {
         // The server handles RAG retrieval per-message from the files array.
         let currentKnowledgeItems = selectedKnowledgeItems
         selectedKnowledgeItems = []
+
+        // Capture and clear skill IDs — sent as skill_ids in the API request.
+        let currentSkillIds = selectedSkillIds
+        selectedSkillIds = []
 
         let currentText = text
         let currentAttachments = processedAttachments
@@ -2145,6 +2257,23 @@ final class ChatViewModel {
                 // (e.g., enabling/disabling web search, image gen, tools)
                 await self.refreshSelectedModelMetadata()
 
+                // Populate model_item with the full raw model JSON so OpenWebUI
+                // can route the request to the correct pipe/function model.
+                // Without model_item, pipe models fail because the server
+                // cannot resolve which pipe function to invoke.
+                request.modelItem = self.selectedModel?.rawModelItem
+
+                // Flag pipe/function models so toJSON() omits session_id/chat_id/id.
+                // Those three fields together trigger the Redis async-task queue (~60s
+                // delay). Pipe models stream directly from the HTTP response body.
+                if self.selectedModel?.isPipeModel == true {
+                    request.isPipeModel = true
+                }
+
+                // Populate filter_ids from model's server-configured filter list.
+                let modelFilterIds = self.selectedModel?.filterIds ?? []
+                if !modelFilterIds.isEmpty { request.filterIds = modelFilterIds }
+
                 // Always send the full features object with explicit true/false for
                 // each feature. Omitting features (or only sending true ones) causes
                 // the server to fall back to the model's defaultFeatureIds, ignoring
@@ -2161,12 +2290,22 @@ final class ChatViewModel {
                 let functionCallingMode = self.selectedModel?.functionCallingMode ?? "default"
                 request.params = ["function_calling": functionCallingMode.isEmpty ? "default" : functionCallingMode]
 
+                // Request usage statistics in the streaming response.
+                // Matches the web UI payload: "stream_options": {"include_usage": true}
+                // The server forwards this to the LLM provider, which returns usage
+                // in the final SSE chunk. We capture it via sendChatCompleted().
+                request.streamOptions = ["include_usage": true]
+
                 // Use only selectedToolIds — model-assigned and globally-enabled
                 // tools are already synced into selectedToolIds by
                 // syncToolSelectionWithDefaults(). This ensures that if the user
                 // disabled a tool via the tools sheet, it stays disabled.
                 let allToolIds = Array(self.selectedToolIds)
                 if !allToolIds.isEmpty { request.toolIds = allToolIds }
+
+                // Include skill IDs selected via the `$` picker.
+                // Sent as `skill_ids` in the top-level request body (separate from tool_ids).
+                if !currentSkillIds.isEmpty { request.skillIds = currentSkillIds }
 
                 // Include terminal_id if terminal is enabled for this session
                 if self.terminalEnabled, let terminalServer = self.selectedTerminalServer {
@@ -2271,6 +2410,56 @@ final class ChatViewModel {
                         isStreaming: false)
                     self.cleanupStreaming()
                     NotificationCenter.default.post(name: .conversationListNeedsRefresh, object: nil)
+                } else if request.isPipeModel {
+                    // ── PIPE MODEL SSE PATH ──
+                    // Pipe/function models bypass the Redis async-task queue when
+                    // session_id, chat_id, and id are absent. Content streams directly
+                    // from the HTTP response body as standard OpenAI SSE.
+                    self.logger.info("Using pipe model SSE path for \(modelId)")
+                    let acc = ContentAccumulator()
+
+                    do {
+                        let sseStream = try await manager.apiClient.sendMessagePipeSSE(request: request)
+                        for try await event in sseStream {
+                            if Task.isCancelled { break }
+
+                            // Content delta tokens
+                            if let delta = event.contentDelta, !delta.isEmpty {
+                                acc.append(delta)
+                                self.updateAssistantMessage(
+                                    id: assistantMessageId,
+                                    content: acc.content,
+                                    isStreaming: true
+                                )
+                            }
+
+                            // Stream finished
+                            if event.isFinished { break }
+                        }
+                    } catch {
+                        if !Task.isCancelled {
+                            self.updateAssistantMessage(
+                                id: assistantMessageId,
+                                content: acc.content.isEmpty ? "" : acc.content,
+                                isStreaming: false,
+                                error: ChatMessageError(content: error.localizedDescription)
+                            )
+                            self.cleanupStreaming()
+                            return
+                        }
+                    }
+
+                    if Task.isCancelled { return }
+
+                    // Finalize — sync the completed message to server, then do
+                    // metadata refresh to pick up any tool-generated files/sources.
+                    self.finishStreamingSuccessfully(
+                        assistantMessageId: assistantMessageId,
+                        modelId: modelId,
+                        socketSessionId: socketSessionId,
+                        effectiveChatId: effectiveChatId,
+                        acc: acc
+                    )
                 } else {
                     // ── SOCKET PATH (normal) ──
                     // HTTP POST returns immediately; content delivered via socket events
@@ -2412,6 +2601,7 @@ final class ChatViewModel {
         // generation don't persist into the new response
         conversation?.messages[assistantIdx].content = ""
         conversation?.messages[assistantIdx].files = []
+        conversation?.messages[assistantIdx].embeds = []
         conversation?.messages[assistantIdx].isStreaming = true
         conversation?.messages[assistantIdx].error = nil
         conversation?.messages[assistantIdx].sources = []
@@ -2498,6 +2688,14 @@ final class ChatViewModel {
                 // Refresh model metadata to pick up live admin changes
                 await self.refreshSelectedModelMetadata()
 
+                // Populate model_item with the full raw model JSON so OpenWebUI
+                // can route the request to the correct pipe/function model.
+                request.modelItem = self.selectedModel?.rawModelItem
+
+                // Populate filter_ids from model's server-configured filter list.
+                let regenFilterIds = self.selectedModel?.filterIds ?? []
+                if !regenFilterIds.isEmpty { request.filterIds = regenFilterIds }
+
                 // Always send the full features object with explicit true/false.
                 let regenFeatures = self.buildChatFeatures()
                 request.features = regenFeatures
@@ -2505,6 +2703,9 @@ final class ChatViewModel {
                 // Always explicitly send the server's function_calling mode.
                 let functionCallingMode = self.selectedModel?.functionCallingMode ?? "default"
                 request.params = ["function_calling": functionCallingMode.isEmpty ? "default" : functionCallingMode]
+
+                // Request usage statistics in the streaming response (matches web UI).
+                request.streamOptions = ["include_usage": true]
 
                 // Use only selectedToolIds — respects user's in-session disabling
                 let allToolIds = Array(self.selectedToolIds)
@@ -2521,23 +2722,67 @@ final class ChatViewModel {
                 if regenFeatures.webSearch { bgTasks["web_search"] = true }
                 request.backgroundTasks = bgTasks
 
-                let json = try await manager.sendMessageHTTP(request: request)
-
-                if let err = json["error"] as? String, !err.isEmpty {
-                    self.updateAssistantMessage(id: assistantMessageId, content: "",
-                                                 isStreaming: false, error: ChatMessageError(content: err))
-                    self.cleanupStreaming()
-                    return
+                // Flag pipe/function models so toJSON() omits session_id/chat_id/id.
+                if self.selectedModel?.isPipeModel == true {
+                    request.isPipeModel = true
                 }
 
-                // Capture the server's task_id for server-side stop
-                if let taskId = json["task_id"] as? String {
-                    self.activeTaskId = taskId
-                }
+                if request.isPipeModel {
+                    // ── PIPE MODEL SSE PATH (regeneration) ──
+                    self.logger.info("Regenerate: using pipe model SSE path for \(modelId)")
+                    let acc = ContentAccumulator()
 
-                self.logger.info("Regenerate HTTP POST done – waiting for socket events")
-                // Do NOT start recovery timer for regeneration — the server still
-                // may have stale content until new streaming completes.
+                    do {
+                        let sseStream = try await manager.apiClient.sendMessagePipeSSE(request: request)
+                        for try await event in sseStream {
+                            if Task.isCancelled { break }
+                            if let delta = event.contentDelta, !delta.isEmpty {
+                                acc.append(delta)
+                                self.updateAssistantMessage(
+                                    id: assistantMessageId, content: acc.content, isStreaming: true)
+                            }
+                            if event.isFinished { break }
+                        }
+                    } catch {
+                        if !Task.isCancelled {
+                            self.updateAssistantMessage(
+                                id: assistantMessageId,
+                                content: acc.content.isEmpty ? "" : acc.content,
+                                isStreaming: false,
+                                error: ChatMessageError(content: error.localizedDescription))
+                            self.cleanupStreaming()
+                            return
+                        }
+                    }
+
+                    if Task.isCancelled { return }
+
+                    self.finishStreamingSuccessfully(
+                        assistantMessageId: assistantMessageId,
+                        modelId: modelId,
+                        socketSessionId: socketSessionId,
+                        effectiveChatId: effectiveChatId,
+                        acc: acc
+                    )
+                } else {
+                    let json = try await manager.sendMessageHTTP(request: request)
+
+                    if let err = json["error"] as? String, !err.isEmpty {
+                        self.updateAssistantMessage(id: assistantMessageId, content: "",
+                                                     isStreaming: false, error: ChatMessageError(content: err))
+                        self.cleanupStreaming()
+                        return
+                    }
+
+                    // Capture the server's task_id for server-side stop
+                    if let taskId = json["task_id"] as? String {
+                        self.activeTaskId = taskId
+                    }
+
+                    self.logger.info("Regenerate HTTP POST done – waiting for socket events")
+                    // Do NOT start recovery timer for regeneration — the server still
+                    // may have stale content until new streaming completes.
+                }
             } catch {
                 if !Task.isCancelled {
                     self.updateAssistantMessage(id: assistantMessageId, content: "",
@@ -3374,7 +3619,20 @@ final class ChatViewModel {
     private func refreshSelectedModelConfig() async {
         guard let modelId = selectedModelId, let manager else { return }
         do {
-            if let fullModel = try await manager.apiClient.fetchModelConfig(modelId: modelId) {
+            if var fullModel = try await manager.apiClient.fetchModelConfig(modelId: modelId) {
+                // Preserve pipe fields from the list endpoint — the single-model endpoint
+                // (/api/v1/models/model) returns workspace-model schema which lacks
+                // pipe/filters fields. Overwriting them would destroy isPipeModel=true,
+                // filterIds, and the correct rawModelItem needed for pipe routing.
+                if let existingModel = availableModels.first(where: { $0.id == modelId }) {
+                    if existingModel.isPipeModel {
+                        fullModel.isPipeModel = existingModel.isPipeModel
+                        fullModel.filterIds = existingModel.filterIds
+                    }
+                    if existingModel.rawModelItem != nil {
+                        fullModel.rawModelItem = existingModel.rawModelItem
+                    }
+                }
                 if let idx = availableModels.firstIndex(where: { $0.id == modelId }) {
                     availableModels[idx] = fullModel
                 } else {
@@ -3382,7 +3640,7 @@ final class ChatViewModel {
                 }
                 lastModelMetadataRefreshTime = Date()
                 syncUIWithModelDefaults()
-                logger.info("Model config loaded: \(modelId) function_calling=\(fullModel.functionCallingMode ?? "default")")
+                logger.info("Model config loaded: \(modelId) function_calling=\(fullModel.functionCallingMode ?? "default") isPipe=\(fullModel.isPipeModel)")
             }
         } catch {
             logger.debug("Model config fetch failed for \(modelId): \(error.localizedDescription)")
@@ -3402,10 +3660,25 @@ final class ChatViewModel {
     private func refreshSelectedModelMetadata() async {
         guard let modelId = selectedModelId, let manager else { return }
         // Skip if we refreshed recently (< 60s) — model admin changes are rare
-        guard Date().timeIntervalSince(lastModelMetadataRefreshTime) > 60 else { return }
+        guard Date().timeIntervalSince(lastModelMetadataRefreshTime) > 60 else {
+            return
+        }
         do {
-            if let fullModel = try await manager.apiClient.fetchModelConfig(modelId: modelId) {
+            if var fullModel = try await manager.apiClient.fetchModelConfig(modelId: modelId) {
                 lastModelMetadataRefreshTime = Date()
+                // Preserve pipe fields from the list endpoint — the single-model endpoint
+                // (/api/v1/models/model) returns workspace-model schema which lacks
+                // pipe/filters fields. Overwriting them would destroy isPipeModel=true,
+                // filterIds, and the correct rawModelItem needed for pipe routing.
+                if let existingModel = availableModels.first(where: { $0.id == modelId }) {
+                    if existingModel.isPipeModel {
+                        fullModel.isPipeModel = existingModel.isPipeModel
+                        fullModel.filterIds = existingModel.filterIds
+                    }
+                    if existingModel.rawModelItem != nil {
+                        fullModel.rawModelItem = existingModel.rawModelItem
+                    }
+                }
                 if let idx = availableModels.firstIndex(where: { $0.id == modelId }) {
                     availableModels[idx] = fullModel
                 }
@@ -3999,6 +4272,19 @@ final class ChatViewModel {
                 let serverContent = serverAssistant.content.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !serverContent.isEmpty && serverContent.count > localContent.count {
                     conversation?.messages[index].content = serverAssistant.content
+                }
+                // Copy usage stats from server — the server stores them after
+                // sendChatCompleted processes the chat. This is how app-sent
+                // messages pick up usage data (the /api/chat/completed endpoint
+                // doesn't return usage directly, but the stored message has it).
+                if conversation?.messages[index].usage == nil,
+                   let serverUsage = serverAssistant.usage, !serverUsage.isEmpty {
+                    conversation?.messages[index].usage = serverUsage
+                }
+                // Copy embeds from server — never overwrite non-empty embeds
+                if conversation?.messages[index].embeds.isEmpty == true,
+                   !serverAssistant.embeds.isEmpty {
+                    conversation?.messages[index].embeds = serverAssistant.embeds
                 }
             }
         }

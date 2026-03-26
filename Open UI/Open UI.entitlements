@@ -10,5 +10,9 @@
 	     when the user backgrounds the app. No effect on iOS < 26. -->
 	<key>com.apple.developer.background-tasks.continued-processing.gpu</key>
 	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.openui.openui</string>
+	</array>
 </dict>
 </plist>

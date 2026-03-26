@@ -46,6 +46,14 @@ struct PasteableTextView: UIViewRepresentable {
     /// backspace deleted the `/`, or whitespace ended the token).
     var onSlashDismiss: (() -> Void)?
 
+    /// Called when the user types `$` at a word boundary. The parameter is
+    /// the filter query text after the `$` (may be empty on initial trigger).
+    var onDollarTrigger: ((String) -> Void)?
+
+    /// Called when the `$` context is dismissed (e.g., cursor moved away,
+    /// backspace deleted the `$`, or whitespace ended the token).
+    var onDollarDismiss: (() -> Void)?
+
     /// Whether pressing Return sends the message (vs inserting a newline).
     var sendOnReturn: Bool
 
@@ -170,6 +178,9 @@ struct PasteableTextView: UIViewRepresentable {
 
             // Detect `/` trigger for prompt library picker
             detectSlashTrigger(in: textView)
+
+            // Detect `$` trigger for skills picker
+            detectDollarTrigger(in: textView)
         }
 
         /// Scans backwards from the cursor to find a `#` token.
@@ -301,6 +312,45 @@ struct PasteableTextView: UIViewRepresentable {
             parent.onSlashDismiss?()
         }
 
+        /// Scans backwards from the cursor to find a `$` token.
+        ///
+        /// Triggers `onDollarTrigger` with the filter query (text after `$`)
+        /// when the cursor is inside a `$word` token at a word boundary.
+        /// Triggers `onDollarDismiss` when the `$` context is lost.
+        private func detectDollarTrigger(in textView: UITextView) {
+            guard parent.onDollarTrigger != nil else { return }
+
+            let text = textView.text ?? ""
+            guard let selectedRange = textView.selectedTextRange else {
+                parent.onDollarDismiss?()
+                return
+            }
+
+            let cursorOffset = textView.offset(from: textView.beginningOfDocument, to: selectedRange.start)
+            let prefix = String(text.prefix(cursorOffset))
+
+            if let dollarIndex = prefix.lastIndex(of: "$") {
+                let dollarPos = prefix.distance(from: prefix.startIndex, to: dollarIndex)
+
+                let isAtStart = dollarPos == 0
+                let precededBySpace = dollarPos > 0 && {
+                    let beforeIdx = prefix.index(before: dollarIndex)
+                    let ch = prefix[beforeIdx]
+                    return ch.isWhitespace || ch.isNewline
+                }()
+
+                if isAtStart || precededBySpace {
+                    let afterDollar = String(prefix[prefix.index(after: dollarIndex)...])
+                    if !afterDollar.contains(where: { $0.isWhitespace || $0.isNewline }) {
+                        parent.onDollarTrigger?(afterDollar)
+                        return
+                    }
+                }
+            }
+
+            parent.onDollarDismiss?()
+        }
+
         func textViewDidBeginEditing(_ textView: UITextView) {
             if let ptv = textView as? PasteInterceptingTextView {
                 ptv.placeholderLabel.isHidden = !textView.text.isEmpty
@@ -332,6 +382,39 @@ final class PasteInterceptingTextView: UITextView {
 
     /// Tracks whether the Shift key is currently held on a hardware keyboard.
     private var isShiftHeld: Bool = false
+
+    /// Observer for the widget "focus input" notification so we can call
+    /// `becomeFirstResponder()` directly on the UIKit text view.
+    /// SwiftUI's `@FocusState` does NOT drive focus for UIViewRepresentable
+    /// views, so this is the only reliable way to show the keyboard
+    /// programmatically (e.g. after opening the app from a widget deep link).
+    private var focusObserver: NSObjectProtocol?
+
+    override init(frame: CGRect, textContainer: NSTextContainer?) {
+        super.init(frame: frame, textContainer: textContainer)
+        setupFocusObserver()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupFocusObserver()
+    }
+
+    private func setupFocusObserver() {
+        focusObserver = NotificationCenter.default.addObserver(
+            forName: .chatInputFieldRequestFocus,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.becomeFirstResponder()
+        }
+    }
+
+    deinit {
+        if let focusObserver {
+            NotificationCenter.default.removeObserver(focusObserver)
+        }
+    }
 
     /// Placeholder label shown when the text view is empty.
     lazy var placeholderLabel: UILabel = {

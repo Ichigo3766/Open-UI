@@ -38,6 +38,12 @@ struct iPadMainChatView: View {
     /// Whether the notes sheet is visible.
     @State private var showNotes = false
 
+    /// Whether the workspace sheet is visible.
+    @State private var showWorkspace = false
+
+    /// Whether the memories sheet is visible.
+    @State private var showMemories = false
+
     /// Controls column visibility for the NavigationSplitView.
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
@@ -56,6 +62,12 @@ struct iPadMainChatView: View {
 
     /// Whether the "create channel" sheet is visible.
     @State private var showCreateChannel = false
+
+    /// Controls the archived chats sheet presentation.
+    @State private var showArchivedChats = false
+
+    /// Controls the shared chats sheet presentation.
+    @State private var showSharedChats = false
 
     /// Rename conversation state.
     @State private var renamingConversation: Conversation?
@@ -82,6 +94,9 @@ struct iPadMainChatView: View {
     /// Terminal file browser (trailing column).
     @State private var terminalBrowserVM = TerminalBrowserViewModel()
 
+    /// Whether the terminal file browser panel is visible (independent of terminal being enabled).
+    @State private var showTerminalBrowser: Bool = true
+
     // MARK: - Body
 
     var body: some View {
@@ -105,6 +120,8 @@ struct iPadMainChatView: View {
             showExportShareSheet: $showExportShareSheet,
             showDeleteAllConfirmation: $showDeleteAllConfirmation,
             showDeleteSelectedConfirmation: $showDeleteSelectedConfirmation,
+            showArchivedChats: $showArchivedChats,
+            showSharedChats: $showSharedChats,
             listViewModel: listViewModel,
             activeConversationId: $activeConversationId,
             voiceCallBinding: $bindableRouter.isVoiceCallPresented,
@@ -132,6 +149,11 @@ struct iPadMainChatView: View {
             scenePhase: scenePhase,
             activeConversationId: $activeConversationId,
             hasRegisteredSocketHandlers: $hasRegisteredSocketHandlers,
+            showCreateChannel: $showCreateChannel,
+            showSettings: $showSettings,
+            showNotes: $showNotes,
+            showCreateFolderSheet: $showCreateFolderSheet,
+            showExportShareSheet: $showExportShareSheet,
             onSocketSetup: { registerSocketReconnectHandler() }
         )
         // Channel-specific lifecycle wiring
@@ -152,6 +174,31 @@ struct iPadMainChatView: View {
                 activeConversationId = nil
                 Haptics.play(.light)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openUINewChatWithFocus)) { _ in
+            // Widget "Ask Open Relay" bar — start new chat and auto-focus keyboard
+            startNewChat()
+            // Give the view time to settle before requesting keyboard focus
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                NotificationCenter.default.post(name: .chatInputFieldRequestFocus, object: nil)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openUIWidgetVoiceCall)) { _ in
+            // Widget mic button — start a voice call with full configuration
+            // (mirrors ChatDetailView's startVoiceCall pattern)
+            let voiceCallVM = dependencies.makeVoiceCallViewModel()
+            let chatVM = dependencies.activeChatStore.viewModel(for: nil)
+            if let manager = dependencies.conversationManager {
+                let modelName = dependencies.activeChatStore.cachedModels
+                    .first(where: { $0.id == dependencies.activeChatStore.cachedSelectedModelId })?.name
+                    ?? "AI Assistant"
+                voiceCallVM.configure(
+                    conversationManager: manager,
+                    chatViewModel: chatVM,
+                    modelName: modelName
+                )
+            }
+            router.presentVoiceCall(viewModel: voiceCallVM)
         }
         .onChange(of: activeChannelId) { _, newId in
             // When entering a channel, the server marks it as read via GET /channels/{id}.
@@ -186,6 +233,24 @@ struct iPadMainChatView: View {
                 allUsers: channelListVM.allServerUsers
             )
         }
+        // Workspace sheet
+        .sheet(isPresented: $showWorkspace) {
+            WorkspaceView()
+                .environment(dependencies)
+                .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+        }
+        // Memories sheet
+        .sheet(isPresented: $showMemories) {
+            NavigationStack {
+                MemoriesView()
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showMemories = false }
+                        }
+                    }
+            }
+            .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+        }
         .overlay {
             if isExporting {
                 exportingOverlay
@@ -209,6 +274,8 @@ struct iPadMainChatView: View {
             showCreateChannel: $showCreateChannel,
             showSettings: $showSettings,
             showNotes: $showNotes,
+            showWorkspace: $showWorkspace,
+            showMemories: $showMemories,
             showDeleteAllConfirmation: $showDeleteAllConfirmation,
             showDeleteSelectedConfirmation: $showDeleteSelectedConfirmation,
             deletingConversation: $deletingConversation,
@@ -228,7 +295,9 @@ struct iPadMainChatView: View {
                 activeConversationId = nil
                 activeChannelId = nil
             },
-            onExport: { conv, format in Task { await exportChat(conv, format: format) } }
+            onExport: { conv, format in Task { await exportChat(conv, format: format) } },
+            onShowArchivedChats: { showArchivedChats = true },
+            onShowSharedChats: { showSharedChats = true }
         )
     }
 
@@ -242,25 +311,52 @@ struct iPadMainChatView: View {
                 chatDetailContent
                     .frame(maxWidth: .infinity)
 
-                Divider()
+                if showTerminalBrowser {
+                    Divider()
 
-                TerminalBrowserView(
-                    viewModel: terminalBrowserVM,
-                    onDismiss: {
-                        let vm = dependencies.activeChatStore.viewModel(for: activeConversationId)
-                        vm.toggleTerminal()
+                    TerminalBrowserView(
+                        viewModel: terminalBrowserVM,
+                        onDismiss: {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                                showTerminalBrowser = false
+                            }
+                        }
+                    )
+                    .frame(width: 340)
+                    .background(theme.background)
+                    .transition(.move(edge: .trailing))
+                    .onAppear {
+                        configureTerminalBrowserIfNeeded()
+                        terminalBrowserVM.refresh()
                     }
-                )
-                .frame(width: 340)
-                .background(theme.background)
-                .onAppear {
-                    configureTerminalBrowserIfNeeded()
-                    terminalBrowserVM.refresh()
                 }
             }
             // ChatDetailView handles its own keyboard via KeyboardTracker.
             // TerminalBrowserView is a fixed side column — no keyboard adjustment needed.
             .ignoresSafeArea(.keyboard)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                            if showTerminalBrowser {
+                                showTerminalBrowser = false
+                            } else {
+                                configureTerminalBrowserIfNeeded()
+                                showTerminalBrowser = true
+                                terminalBrowserVM.refresh()
+                            }
+                        }
+                        Haptics.play(.light)
+                    } label: {
+                        Image(systemName: showTerminalBrowser ? "sidebar.right" : "sidebar.right")
+                            .scaledFont(size: 14, weight: .medium)
+                            .foregroundStyle(showTerminalBrowser ? theme.brandPrimary : theme.textSecondary)
+                            .symbolVariant(showTerminalBrowser ? .fill : .none)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(showTerminalBrowser ? "Hide Files" : "Show Files")
+                }
+            }
         } else {
             chatDetailContent
         }
@@ -414,6 +510,7 @@ struct iPadMainChatView: View {
         activeChannelId = nil
         activeFolderWorkspaceId = nil
         terminalBrowserVM.reset()
+        showTerminalBrowser = true
         Haptics.play(.light)
     }
 
@@ -522,6 +619,8 @@ struct iPadSidebarContent: View {
     @Binding var showCreateChannel: Bool
     @Binding var showSettings: Bool
     @Binding var showNotes: Bool
+    @Binding var showWorkspace: Bool
+    @Binding var showMemories: Bool
     @Binding var showDeleteAllConfirmation: Bool
     @Binding var showDeleteSelectedConfirmation: Bool
     @Binding var deletingConversation: Conversation?
@@ -534,9 +633,16 @@ struct iPadSidebarContent: View {
     /// Called when the folder name/icon is tapped — opens folder workspace in the detail pane.
     var onSelectFolder: ((String) -> Void)?
     let onExport: (Conversation, iPadMainChatView.ExportFormat) -> Void
+    var onShowArchivedChats: (() -> Void)? = nil
+    var onShowSharedChats: (() -> Void)? = nil
 
     @Environment(\.theme) private var theme
     @State private var drawerChatsDropActive = false
+
+    /// Top-level section collapse states (shared with iPhone via same AppStorage keys).
+    @AppStorage("sidebar_folders_expanded") private var foldersExpanded: Bool = true
+    @AppStorage("sidebar_channels_expanded") private var channelsExpanded: Bool = true
+    @AppStorage("sidebar_chats_expanded") private var chatsExpanded: Bool = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -645,6 +751,20 @@ struct iPadSidebarContent: View {
                                 Label("Delete All", systemImage: "trash")
                             }
                         }
+
+                        Divider()
+
+                        Button {
+                            onShowArchivedChats?()
+                        } label: {
+                            Label("Archived Chats", systemImage: "archivebox")
+                        }
+
+                        Button {
+                            onShowSharedChats?()
+                        } label: {
+                            Label("Shared Chats", systemImage: "link.circle")
+                        }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                             .scaledFont(size: 15, weight: .medium)
@@ -730,69 +850,87 @@ struct iPadSidebarContent: View {
     @ViewBuilder
     private func foldersSection(folderVM: FolderListViewModel) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "folder")
-                    .scaledFont(size: 9, weight: .semibold)
-                    .foregroundStyle(theme.textTertiary)
-                Text("Folders")
-                    .scaledFont(size: 12, weight: .medium)
-                    .fontWeight(.bold)
-                    .foregroundStyle(theme.textTertiary)
-                    .textCase(.uppercase)
-                    .tracking(0.5)
-                Spacer()
-                Button { showCreateFolderSheet = true } label: {
-                    Image(systemName: "folder.badge.plus")
-                        .scaledFont(size: 13)
-                        .foregroundStyle(theme.textTertiary)
+            // Collapsible header
+            Button {
+                withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                    foldersExpanded.toggle()
                 }
-                .buttonStyle(.plain)
+                Haptics.play(.light)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.down")
+                        .scaledFont(size: 8, weight: .bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(foldersExpanded ? 0 : -90))
+                        .animation(.easeInOut(duration: AnimDuration.fast), value: foldersExpanded)
+
+                    Image(systemName: "folder")
+                        .scaledFont(size: 9, weight: .semibold)
+                        .foregroundStyle(theme.textTertiary)
+                    Text("Folders")
+                        .scaledFont(size: 12, weight: .medium)
+                        .fontWeight(.bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .textCase(.uppercase)
+                        .tracking(0.5)
+                    Spacer()
+                    Button { showCreateFolderSheet = true } label: {
+                        Image(systemName: "folder.badge.plus")
+                            .scaledFont(size: 13)
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.top, Spacing.sm)
+                .padding(.bottom, Spacing.xs)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, Spacing.md)
-            .padding(.top, Spacing.sm)
-            .padding(.bottom, Spacing.xs)
+            .buttonStyle(.plain)
 
             // Use rootFolders (tree with childFolders populated) for proper subfolder nesting
-            ForEach(folderVM.rootFolders) { folder in
-                DrawerFolderRow(
-                    folder: folder,
-                    folderVM: folderVM,
-                    allConversations: listViewModel.conversations,
-                    activeConversationId: activeConversationId,
-                    activeFolderWorkspaceId: activeFolderWorkspaceId,
-                    onSelectChat: { chatId in
-                        activeConversationId = chatId
-                        activeFolderWorkspaceId = nil
-                        SharedDataService.shared.saveLastActiveConversationId(chatId)
-                        // No drawer to close on iPad — sidebar stays visible
-                    },
-                    onSelectFolder: onSelectFolder,
-                    onChatMoved: { chatId, targetFolderId in
-                        if let idx = listViewModel.conversations.firstIndex(where: { $0.id == chatId }) {
-                            listViewModel.conversations[idx].folderId = targetFolderId
-                        } else if targetFolderId == nil {
-                            let folderChats = folderVM.folders.flatMap(\.chats)
-                            if var conv = folderChats.first(where: { $0.id == chatId }) {
-                                conv.folderId = nil
-                                listViewModel.conversations.insert(conv, at: 0)
+            if foldersExpanded {
+                ForEach(folderVM.rootFolders) { folder in
+                    DrawerFolderRow(
+                        folder: folder,
+                        folderVM: folderVM,
+                        allConversations: listViewModel.conversations,
+                        activeConversationId: activeConversationId,
+                        activeFolderWorkspaceId: activeFolderWorkspaceId,
+                        onSelectChat: { chatId in
+                            activeConversationId = chatId
+                            activeFolderWorkspaceId = nil
+                            SharedDataService.shared.saveLastActiveConversationId(chatId)
+                            // No drawer to close on iPad — sidebar stays visible
+                        },
+                        onSelectFolder: onSelectFolder,
+                        onChatMoved: { chatId, targetFolderId in
+                            if let idx = listViewModel.conversations.firstIndex(where: { $0.id == chatId }) {
+                                listViewModel.conversations[idx].folderId = targetFolderId
+                            } else if targetFolderId == nil {
+                                let folderChats = folderVM.folders.flatMap(\.chats)
+                                if var conv = folderChats.first(where: { $0.id == chatId }) {
+                                    conv.folderId = nil
+                                    listViewModel.conversations.insert(conv, at: 0)
+                                }
                             }
-                        }
-                    },
-                    onDeleteChat: { chatId in
-                        Task {
-                            await listViewModel.deleteConversation(id: chatId)
-                            // Clear from all folders (root + subfolders) to avoid stale UI
-                            for fIdx in folderVM.folders.indices {
-                                folderVM.folders[fIdx].chats.removeAll { $0.id == chatId }
+                        },
+                        onDeleteChat: { chatId in
+                            Task {
+                                await listViewModel.deleteConversation(id: chatId)
+                                // Clear from all folders (root + subfolders) to avoid stale UI
+                                for fIdx in folderVM.folders.indices {
+                                    folderVM.folders[fIdx].chats.removeAll { $0.id == chatId }
+                                }
+                                if activeConversationId == chatId { activeConversationId = nil }
                             }
-                            if activeConversationId == chatId { activeConversationId = nil }
+                        },
+                        onTogglePin: { conversation in
+                            Task { await listViewModel.togglePin(conversation: conversation) }
                         }
-                    },
-                    onTogglePin: { conversation in
-                        Task { await listViewModel.togglePin(conversation: conversation) }
-                    }
-                )
-                .padding(.horizontal, Spacing.sm)
+                    )
+                    .padding(.horizontal, Spacing.sm)
+                }
             }
         }
         .animation(.easeInOut(duration: AnimDuration.medium), value: folderVM.folders.map(\.id))
@@ -802,53 +940,71 @@ struct iPadSidebarContent: View {
 
     private var channelsSection: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "bubble.left.and.bubble.right")
-                    .scaledFont(size: 9, weight: .semibold)
-                    .foregroundStyle(theme.textTertiary)
-                Text("Channels")
-                    .scaledFont(size: 12, weight: .medium)
-                    .fontWeight(.bold)
-                    .foregroundStyle(theme.textTertiary)
-                    .textCase(.uppercase)
-                    .tracking(0.5)
-                Spacer()
-                Button { showCreateChannel = true } label: {
-                    Image(systemName: "plus.bubble")
+            // Collapsible header
+            Button {
+                withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                    channelsExpanded.toggle()
+                }
+                Haptics.play(.light)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.down")
+                        .scaledFont(size: 8, weight: .bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(channelsExpanded ? 0 : -90))
+                        .animation(.easeInOut(duration: AnimDuration.fast), value: channelsExpanded)
+
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .scaledFont(size: 9, weight: .semibold)
+                        .foregroundStyle(theme.textTertiary)
+                    Text("Channels")
+                        .scaledFont(size: 12, weight: .medium)
+                        .fontWeight(.bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .textCase(.uppercase)
+                        .tracking(0.5)
+                    Spacer()
+                    Button { showCreateChannel = true } label: {
+                        Image(systemName: "plus.bubble")
+                            .scaledFont(size: 13)
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, Spacing.sm)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if channelsExpanded {
+                if channelListVM.channels.isEmpty {
+                    Text("No channels yet")
                         .scaledFont(size: 13)
                         .foregroundStyle(theme.textTertiary)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, Spacing.md)
-            .padding(.vertical, Spacing.sm)
-
-            if channelListVM.channels.isEmpty {
-                Text("No channels yet")
-                    .scaledFont(size: 13)
-                    .foregroundStyle(theme.textTertiary)
-                    .padding(.horizontal, Spacing.md)
-                    .padding(.vertical, 4)
-            } else {
-                // DMs first
-                if !channelListVM.dmChannels.isEmpty {
-                    channelGroupLabel("Direct Messages", icon: "person.crop.circle")
-                    ForEach(channelListVM.dmChannels) { channel in
-                        channelRow(channel)
+                        .padding(.horizontal, Spacing.md)
+                        .padding(.vertical, 4)
+                } else {
+                    // DMs first
+                    if !channelListVM.dmChannels.isEmpty {
+                        channelGroupLabel("Direct Messages", icon: "person.crop.circle")
+                        ForEach(channelListVM.dmChannels) { channel in
+                            channelRow(channel)
+                        }
                     }
-                }
-                // Groups
-                if !channelListVM.groupChannels.isEmpty {
-                    channelGroupLabel("Groups", icon: "person.3")
-                    ForEach(channelListVM.groupChannels) { channel in
-                        channelRow(channel)
+                    // Groups
+                    if !channelListVM.groupChannels.isEmpty {
+                        channelGroupLabel("Groups", icon: "person.3")
+                        ForEach(channelListVM.groupChannels) { channel in
+                            channelRow(channel)
+                        }
                     }
-                }
-                // Standard channels
-                if !channelListVM.standardChannels.isEmpty {
-                    channelGroupLabel("Channels", icon: "number")
-                    ForEach(channelListVM.standardChannels) { channel in
-                        channelRow(channel)
+                    // Standard channels
+                    if !channelListVM.standardChannels.isEmpty {
+                        channelGroupLabel("Channels", icon: "number")
+                        ForEach(channelListVM.standardChannels) { channel in
+                            channelRow(channel)
+                        }
                     }
                 }
             }
@@ -949,42 +1105,60 @@ struct iPadSidebarContent: View {
     @ViewBuilder
     private func chatsSection(folderVM: FolderListViewModel) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "bubble.left.and.text.bubble.right")
-                    .scaledFont(size: 9, weight: .semibold)
-                    .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
-                Text("Chats")
-                    .scaledFont(size: 12, weight: .medium)
-                    .fontWeight(.bold)
-                    .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
-                    .textCase(.uppercase)
-                    .tracking(0.5)
-                if drawerChatsDropActive {
-                    Text("Drop here")
-                        .scaledFont(size: 12, weight: .medium)
-                        .foregroundStyle(theme.brandPrimary)
-                        .transition(.opacity)
+            // Collapsible header
+            Button {
+                withAnimation(.easeInOut(duration: AnimDuration.fast)) {
+                    chatsExpanded.toggle()
                 }
-                Spacer()
-            }
-            .padding(.horizontal, Spacing.md)
-            .padding(.top, Spacing.sm)
-            .padding(.bottom, Spacing.xs)
+                Haptics.play(.light)
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.down")
+                        .scaledFont(size: 8, weight: .bold)
+                        .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
+                        .rotationEffect(.degrees(chatsExpanded ? 0 : -90))
+                        .animation(.easeInOut(duration: AnimDuration.fast), value: chatsExpanded)
 
-            // Pinned
-            if !listViewModel.pinnedConversations.isEmpty {
-                CollapsibleDrawerSection(title: "Pinned") {
-                    ForEach(listViewModel.pinnedConversations) { conversation in
-                        conversationRow(conversation)
+                    Image(systemName: "bubble.left.and.text.bubble.right")
+                        .scaledFont(size: 9, weight: .semibold)
+                        .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
+                    Text("Chats")
+                        .scaledFont(size: 12, weight: .medium)
+                        .fontWeight(.bold)
+                        .foregroundStyle(drawerChatsDropActive ? theme.brandPrimary : theme.textTertiary)
+                        .textCase(.uppercase)
+                        .tracking(0.5)
+                    if drawerChatsDropActive {
+                        Text("Drop here")
+                            .scaledFont(size: 12, weight: .medium)
+                            .foregroundStyle(theme.brandPrimary)
+                            .transition(.opacity)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.top, Spacing.sm)
+                .padding(.bottom, Spacing.xs)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if chatsExpanded {
+                // Pinned
+                if !listViewModel.pinnedConversations.isEmpty {
+                    CollapsibleDrawerSection(title: "Pinned") {
+                        ForEach(listViewModel.pinnedConversations) { conversation in
+                            conversationRow(conversation)
+                        }
                     }
                 }
-            }
 
-            // Time-grouped
-            ForEach(listViewModel.groupedConversations, id: \.0) { group in
-                CollapsibleDrawerSection(title: group.0, count: group.1.count) {
-                    ForEach(group.1) { conversation in
-                        conversationRow(conversation)
+                // Time-grouped
+                ForEach(listViewModel.groupedConversations, id: \.0) { group in
+                    CollapsibleDrawerSection(title: group.0, count: group.1.count) {
+                        ForEach(group.1) { conversation in
+                            conversationRow(conversation)
+                        }
                     }
                 }
             }
@@ -1135,63 +1309,80 @@ struct iPadSidebarContent: View {
     }
 
     private var sidebarBottomBar: some View {
-        HStack(spacing: Spacing.md) {
-            // Real user avatar + name (mirrors iPhone drawer bottom bar)
-            Button { showSettings = true } label: {
-                HStack(spacing: Spacing.sm) {
-                    UserAvatar(
-                        size: 30,
-                        imageURL: {
-                            guard let userId = dependencies.authViewModel.currentUser?.id,
-                                  let baseURL = dependencies.apiClient?.baseURL,
-                                  !userId.isEmpty, !baseURL.isEmpty else { return nil }
-                            return URL(string: "\(baseURL)/api/v1/users/\(userId)/profile/image")
-                        }(),
-                        name: dependencies.authViewModel.currentUser?.displayName ?? "User",
-                        authToken: dependencies.apiClient?.network.authToken
-                    )
-                    Text(dependencies.authViewModel.currentUser?.displayName ?? "User")
-                        .scaledFont(size: 12, weight: .medium)
-                        .fontWeight(.medium)
-                        .foregroundStyle(theme.textPrimary)
-                        .lineLimit(1)
+        VStack(spacing: 0) {
+            // Subtle top separator
+            Rectangle()
+                .fill(theme.textTertiary.opacity(0.12))
+                .frame(height: 0.5)
+
+            HStack(spacing: Spacing.sm) {
+                // Real user avatar + full name — taps to Settings/Profile
+                Button { showSettings = true } label: {
+                    HStack(spacing: 8) {
+                        UserAvatar(
+                            size: 30,
+                            imageURL: {
+                                guard let userId = dependencies.authViewModel.currentUser?.id,
+                                      let baseURL = dependencies.apiClient?.baseURL,
+                                      !userId.isEmpty, !baseURL.isEmpty else { return nil }
+                                return URL(string: "\(baseURL)/api/v1/users/\(userId)/profile/image")
+                            }(),
+                            name: dependencies.authViewModel.currentUser?.displayName ?? "User",
+                            authToken: dependencies.apiClient?.network.authToken
+                        )
+                        Text(dependencies.authViewModel.currentUser?.displayName ?? "User")
+                            .scaledFont(size: 13, weight: .medium)
+                            .foregroundStyle(theme.textPrimary)
+                            .lineLimit(1)
+                    }
+                    .contentShape(Rectangle())
                 }
-            }
-            .buttonStyle(.plain)
+                .buttonStyle(.plain)
 
-            Spacer()
+                Spacer()
 
-            // Notes (only shown when enabled on server)
-            if dependencies.authViewModel.backendConfig?.features?.enableNotes != false {
-                Button { showNotes = true } label: {
-                    Image(systemName: "note.text")
+                // New Chat — primary action, always visible
+                Button(action: onNewChat) {
+                    Image(systemName: "square.and.pencil")
                         .scaledFont(size: 15, weight: .medium)
-                        .foregroundStyle(theme.textTertiary)
+                        .foregroundStyle(theme.textSecondary)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("New Chat")
+
+                // More menu — secondary actions tucked away cleanly
+                Menu {
+                    Button { showMemories = true } label: {
+                        Label("Memories", systemImage: "brain.head.profile")
+                    }
+                    Button { showWorkspace = true } label: {
+                        Label("Workspace", systemImage: "square.grid.2x2")
+                    }
+
+                    if dependencies.authViewModel.backendConfig?.features?.enableNotes != false {
+                        Button { showNotes = true } label: {
+                            Label("Notes", systemImage: "note.text")
+                        }
+                    }
+
+                    Divider()
+
+                    Button { showSettings = true } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .scaledFont(size: 17, weight: .medium)
+                        .foregroundStyle(theme.textSecondary)
                         .frame(width: 36, height: 36)
                         .contentShape(Rectangle())
                 }
             }
-
-            // Settings
-            Button { showSettings = true } label: {
-                Image(systemName: "gearshape")
-                    .scaledFont(size: 15, weight: .medium)
-                    .foregroundStyle(theme.textTertiary)
-                    .frame(width: 36, height: 36)
-                    .contentShape(Rectangle())
-            }
+            .padding(.horizontal, Spacing.md)
+            .padding(.vertical, 10)
         }
-        .padding(.horizontal, Spacing.md)
-        .padding(.vertical, Spacing.sm)
-        .background(
-            theme.surfaceContainer.opacity(0.25)
-                .overlay(
-                    Rectangle()
-                        .fill(theme.textTertiary.opacity(0.1))
-                        .frame(height: 0.5),
-                    alignment: .top
-                )
-        )
+        .background(theme.background)
     }
 }
 
@@ -1335,6 +1526,8 @@ private extension View {
         showExportShareSheet: Binding<Bool>,
         showDeleteAllConfirmation: Binding<Bool>,
         showDeleteSelectedConfirmation: Binding<Bool>,
+        showArchivedChats: Binding<Bool>,
+        showSharedChats: Binding<Bool>,
         listViewModel: ChatListViewModel,
         activeConversationId: Binding<String?>,
         voiceCallBinding: Binding<Bool>,
@@ -1454,6 +1647,18 @@ private extension View {
                     )
                     .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
                 }
+            }
+            // Archived chats sheet
+            .sheet(isPresented: showArchivedChats) {
+                ArchivedChatsView()
+                    .environment(dependencies)
+                    .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+            }
+            // Shared chats sheet
+            .sheet(isPresented: showSharedChats) {
+                SharedChatsView()
+                    .environment(dependencies)
+                    .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
             }
     }
 
@@ -1575,6 +1780,11 @@ private extension View {
         scenePhase: ScenePhase,
         activeConversationId: Binding<String?>,
         hasRegisteredSocketHandlers: Binding<Bool>,
+        showCreateChannel: Binding<Bool> = .constant(false),
+        showSettings: Binding<Bool> = .constant(false),
+        showNotes: Binding<Bool> = .constant(false),
+        showCreateFolderSheet: Binding<Bool> = .constant(false),
+        showExportShareSheet: Binding<Bool> = .constant(false),
         onSocketSetup: @escaping () -> Void
     ) -> some View {
         self
@@ -1636,6 +1846,19 @@ private extension View {
                         SharedDataService.shared.saveLastActiveConversationId(conversationId)
                     }
                 }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUIDismissOverlays)) { _ in
+                // Quick action requested — dismiss any active sheet/cover so
+                // the new action doesn't stack on top of the old one.
+                showSettings.wrappedValue = false
+                showNotes.wrappedValue = false
+                showCreateChannel.wrappedValue = false
+                showCreateFolderSheet.wrappedValue = false
+                showExportShareSheet.wrappedValue = false
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openUINewChannel)) { _ in
+                // Widget "Channel" button — open the create-channel sheet
+                showCreateChannel.wrappedValue = true
             }
     }
 }

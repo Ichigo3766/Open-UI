@@ -7,6 +7,11 @@ import os.log
 ///
 /// Manages the listen → process → speak → listen cycle for hands-free
 /// conversational AI interaction.
+///
+/// Supports two STT backends:
+/// - **Apple on-device** (`SpeechRecognitionService`) — default, works offline
+/// - **Server-side** (`ServerSpeechRecognitionService`) — records mic → uploads to
+///   `POST /api/v1/audio/transcriptions` when `sttEngine == "server"`
 @MainActor @Observable
 final class VoiceCallViewModel {
 
@@ -38,6 +43,9 @@ final class VoiceCallViewModel {
     /// Whether the call is paused.
     private(set) var isPaused: Bool = false
 
+    /// Whether audio is routed to the loudspeaker.
+    private(set) var isSpeakerOn: Bool = true
+
     /// The model name being used.
     private(set) var modelName: String = ""
 
@@ -49,17 +57,23 @@ final class VoiceCallViewModel {
 
     // MARK: - Dependencies
 
-    private let speechService: SpeechRecognitionService
+    /// Apple on-device STT — set when not using server STT.
+    private let speechService: SpeechRecognitionService?
+    /// Server-side STT — set when `sttEngine == "server"`.
+    private let serverSpeechService: ServerSpeechRecognitionService?
     private let ttsService: TextToSpeechService
     private let callKitManager: CallKitManager
     private var conversationManager: ConversationManager?
     private var chatViewModel: ChatViewModel?
 
+    /// True when using the server-based STT (records → uploads) instead of Apple Speech.
+    var isUsingServerSTT: Bool { serverSpeechService != nil }
+
     private let logger = Logger(subsystem: "com.openui", category: "VoiceCall")
     private var durationTimer: Task<Void, Never>?
     private var callStartTime: Date?
 
-    // MARK: - Init
+    // MARK: - Init (Apple on-device STT)
 
     init(
         speechService: SpeechRecognitionService,
@@ -67,6 +81,22 @@ final class VoiceCallViewModel {
         callKitManager: CallKitManager
     ) {
         self.speechService = speechService
+        self.serverSpeechService = nil
+        self.ttsService = ttsService
+        self.callKitManager = callKitManager
+
+        setupCallbacks()
+    }
+
+    // MARK: - Init (Server-side STT)
+
+    init(
+        serverSpeechService: ServerSpeechRecognitionService,
+        ttsService: TextToSpeechService,
+        callKitManager: CallKitManager
+    ) {
+        self.speechService = nil
+        self.serverSpeechService = serverSpeechService
         self.ttsService = ttsService
         self.callKitManager = callKitManager
 
@@ -94,8 +124,14 @@ final class VoiceCallViewModel {
 
         callState = .connecting
 
-        // Request permissions
-        let authorized = await speechService.requestPermissions()
+        // Request permissions (both STT backends need mic access)
+        let authorized: Bool
+        if let serverSTT = serverSpeechService {
+            authorized = await serverSTT.requestPermissions()
+        } else {
+            authorized = await speechService?.requestPermissions() ?? false
+        }
+
         guard authorized else {
             callState = .error("Microphone and speech recognition permissions are required.")
             errorMessage = "Please grant microphone and speech recognition permissions in Settings."
@@ -109,11 +145,23 @@ final class VoiceCallViewModel {
             logger.warning("CallKit start failed (non-fatal): \(error.localizedDescription)")
         }
 
+        // Apply the user's TTS configuration so voice calls use identical
+        // settings to the chat read-aloud button (speech rate, voice, engine).
+        let rate = UserDefaults.standard.double(forKey: "ttsSpeechRate")
+        if rate > 0 {
+            ttsService.speechRate = Float(rate) * AVSpeechUtteranceDefaultSpeechRate
+        }
+        let voiceId = UserDefaults.standard.string(forKey: "ttsVoiceIdentifier") ?? ""
+        ttsService.voiceIdentifier = voiceId.isEmpty ? nil : voiceId
+
         // Preload MarvisTTS model only if the user explicitly chose Marvis
         if ttsService.preferredEngine == .marvis {
             logger.info("Voice call: preloading MarvisTTS model...")
             await ttsService.preloadMarvisModel()
         }
+
+        // Enable speaker override in TTS service for the duration of this call
+        ttsService.speakerOverrideEnabled = isSpeakerOn
 
         // Start call timer
         callStartTime = Date()
@@ -125,7 +173,7 @@ final class VoiceCallViewModel {
 
     /// Ends the current voice call.
     func endCall() async {
-        speechService.stopListening()
+        stopActiveSTT()
         ttsService.stop()
         await callKitManager.endCall()
 
@@ -134,6 +182,9 @@ final class VoiceCallViewModel {
         callState = .disconnected
         currentTranscript = ""
         voiceIntensity = 0
+
+        // Disable speaker override so TTS outside a call behaves normally
+        ttsService.speakerOverrideEnabled = false
 
         // CRITICAL: Clear all shared service callbacks so a stale VM reference
         // cannot restart the microphone after the call ends. Without this, the
@@ -146,7 +197,7 @@ final class VoiceCallViewModel {
     /// Pauses listening.
     func pauseListening() {
         isPaused = true
-        speechService.stopListening()
+        stopActiveSTT()
         callState = .paused
     }
 
@@ -161,7 +212,7 @@ final class VoiceCallViewModel {
         isMuted.toggle()
         if isMuted {
             ttsService.stop()
-            speechService.stopListening()
+            stopActiveSTT()
             callState = .paused
         } else {
             Task { await startListening() }
@@ -172,6 +223,23 @@ final class VoiceCallViewModel {
     func cancelSpeaking() async {
         ttsService.stop()
         await startListening()
+    }
+
+    /// Toggles audio output between loudspeaker and earpiece.
+    func toggleSpeaker() {
+        isSpeakerOn.toggle()
+        ttsService.speakerOverrideEnabled = isSpeakerOn
+        applySpeakerOverride()
+    }
+
+    /// Applies the current speaker routing preference to the active audio session.
+    func applySpeakerOverride() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.overrideOutputAudioPort(isSpeakerOn ? .speaker : .none)
+        } catch {
+            logger.warning("Speaker override failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Formatted Duration
@@ -188,46 +256,73 @@ final class VoiceCallViewModel {
         switch callState {
         case .idle: return "Ready"
         case .connecting: return "Connecting…"
-        case .listening: return "Listening…"
+        case .listening:
+            return isUsingServerSTT ? "Recording…" : "Listening…"
         case .paused: return "Paused"
-        case .processing: return "Thinking…"
+        case .processing:
+            return isUsingServerSTT ? "Transcribing…" : "Thinking…"
         case .speaking: return "Speaking"
         case .error: return "Error"
         case .disconnected: return "Call Ended"
         }
     }
 
-    // MARK: - Private
+    // MARK: - Private Helpers
+
+    /// Stops whichever STT service is active.
+    private func stopActiveSTT() {
+        if let serverSTT = serverSpeechService {
+            serverSTT.stopListening()
+        } else {
+            speechService?.stopListening()
+        }
+    }
+
+    /// Current intensity from whichever STT service is active.
+    private var activeIntensity: Int {
+        if let serverSTT = serverSpeechService { return serverSTT.intensity }
+        return speechService?.intensity ?? 0
+    }
+
+    /// Current transcript from whichever STT service is active.
+    private var activeCurrentTranscript: String {
+        if let serverSTT = serverSpeechService { return serverSTT.currentTranscript }
+        return speechService?.currentTranscript ?? ""
+    }
 
     /// Clears all callbacks installed on shared services.
     /// Must be called when the call ends to prevent a stale VM from
     /// restarting the microphone the next time any TTS plays elsewhere in the app.
     private func clearCallbacks() {
-        speechService.onFinalTranscript = nil
-        speechService.onStateChanged = nil
-        speechService.onError = nil
+        speechService?.onFinalTranscript = nil
+        speechService?.onStateChanged = nil
+        speechService?.onError = nil
+        serverSpeechService?.onFinalTranscript = nil
+        serverSpeechService?.onStateChanged = nil
+        serverSpeechService?.onError = nil
         ttsService.onStart = nil
         ttsService.onComplete = nil
         ttsService.onError = nil
         callKitManager.onCallEnded = nil
         callKitManager.onMuteToggled = nil
+        callKitManager.onAudioSessionActivated = nil
     }
 
     /// Sets up callbacks between services.
     private func setupCallbacks() {
-        // Speech recognition callbacks
-        speechService.onFinalTranscript = { [weak self] transcript in
+        // --- Apple on-device STT callbacks ---
+        speechService?.onFinalTranscript = { [weak self] transcript in
             Task { @MainActor [weak self] in
                 await self?.handleFinalTranscript(transcript)
             }
         }
 
-        speechService.onStateChanged = { [weak self] state in
+        speechService?.onStateChanged = { [weak self] state in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 switch state {
                 case .listening:
-                    self.voiceIntensity = self.speechService.intensity
+                    self.voiceIntensity = self.speechService?.intensity ?? 0
                 case .error(let msg):
                     self.logger.error("Speech error: \(msg)")
                 default:
@@ -236,7 +331,53 @@ final class VoiceCallViewModel {
             }
         }
 
-        // TTS callbacks
+        speechService?.onError = { [weak self] error in
+            Task { @MainActor [weak self] in
+                self?.logger.error("Speech recognition error: \(error)")
+            }
+        }
+
+        // --- Server STT callbacks ---
+        serverSpeechService?.onFinalTranscript = { [weak self] transcript in
+            Task { @MainActor [weak self] in
+                await self?.handleFinalTranscript(transcript)
+            }
+        }
+
+        serverSpeechService?.onStateChanged = { [weak self] state in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                switch state {
+                case .listening:
+                    self.voiceIntensity = self.serverSpeechService?.intensity ?? 0
+                case .processing:
+                    // Server is uploading/transcribing — show a processing state
+                    if self.callState == .listening {
+                        self.callState = .processing
+                    }
+                case .error(let msg):
+                    self.logger.error("Server STT error: \(msg)")
+                    // On error, restart listening so the call continues
+                    if !self.isPaused && !self.isMuted {
+                        Task { await self.startListening() }
+                    }
+                default:
+                    break
+                }
+            }
+        }
+
+        serverSpeechService?.onError = { [weak self] error in
+            Task { @MainActor [weak self] in
+                self?.logger.error("Server STT error: \(error)")
+                // On network error during voice call, fall back gracefully
+                if let self, !self.isPaused && !self.isMuted {
+                    await self.startListening()
+                }
+            }
+        }
+
+        // --- TTS callbacks ---
         ttsService.onStart = { [weak self] in
             Task { @MainActor [weak self] in
                 self?.callState = .speaking
@@ -261,7 +402,7 @@ final class VoiceCallViewModel {
             }
         }
 
-        // CallKit callbacks
+        // --- CallKit callbacks ---
         callKitManager.onCallEnded = { [weak self] in
             Task { @MainActor [weak self] in
                 await self?.endCall()
@@ -272,16 +413,23 @@ final class VoiceCallViewModel {
             Task { @MainActor [weak self] in
                 self?.isMuted = muted
                 if muted {
-                    self?.speechService.stopListening()
+                    self?.stopActiveSTT()
                     self?.ttsService.stop()
                 } else {
                     await self?.startListening()
                 }
             }
         }
+
+        callKitManager.onAudioSessionActivated = { [weak self] in
+            Task { @MainActor [weak self] in
+                // CallKit reset the audio session — re-apply our speaker preference
+                self?.applySpeakerOverride()
+            }
+        }
     }
 
-    /// Starts speech recognition.
+    /// Starts speech recognition using whichever STT backend is active.
     private func startListening() async {
         guard !isMuted, !isPaused else {
             callState = .paused
@@ -294,6 +442,7 @@ final class VoiceCallViewModel {
             try session.setCategory(.playAndRecord, mode: .voiceChat,
                                     options: [.defaultToSpeaker, .allowBluetoothA2DP])
             try session.setActive(true)
+            try session.overrideOutputAudioPort(isSpeakerOn ? .speaker : .none)
         } catch {
             logger.warning("Audio session reconfig for listening: \(error.localizedDescription)")
         }
@@ -301,23 +450,49 @@ final class VoiceCallViewModel {
         currentTranscript = ""
         callState = .listening
 
-        do {
-            try await speechService.startListening()
-        } catch {
-            logger.error("Failed to start listening: \(error.localizedDescription)")
-            callState = .error(error.localizedDescription)
-            errorMessage = error.localizedDescription
+        if let serverSTT = serverSpeechService {
+            // Server STT: record audio → upload → onFinalTranscript fires when done
+            do {
+                try await serverSTT.startListening()
+            } catch {
+                logger.error("Server STT failed to start: \(error.localizedDescription)")
+                callState = .error(error.localizedDescription)
+                errorMessage = error.localizedDescription
+                return
+            }
+            // Monitor intensity from server STT recorder
+            monitorServerSTTIntensity()
+        } else {
+            // Apple on-device STT
+            do {
+                try await speechService?.startListening()
+            } catch {
+                logger.error("Failed to start listening: \(error.localizedDescription)")
+                callState = .error(error.localizedDescription)
+                errorMessage = error.localizedDescription
+                return
+            }
+            monitorAppleSTTIntensity()
         }
-
-        monitorIntensity()
     }
 
-    /// Monitors voice intensity for waveform display.
-    private func monitorIntensity() {
+    /// Monitors voice intensity from the Apple STT service for waveform display.
+    private func monitorAppleSTTIntensity() {
         Task {
             while callState == .listening {
-                voiceIntensity = speechService.intensity
-                currentTranscript = speechService.currentTranscript
+                voiceIntensity = speechService?.intensity ?? 0
+                currentTranscript = speechService?.currentTranscript ?? ""
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+    }
+
+    /// Monitors voice intensity from the server STT recorder for waveform display.
+    private func monitorServerSTTIntensity() {
+        Task {
+            while callState == .listening {
+                voiceIntensity = serverSpeechService?.intensity ?? 0
+                // Server STT has no real-time partial transcripts — show empty
                 try? await Task.sleep(for: .milliseconds(50))
             }
         }
@@ -335,7 +510,7 @@ final class VoiceCallViewModel {
         }
     }
 
-    /// Handles the final transcript from speech recognition.
+    /// Handles the final transcript from whichever STT service is active.
     private func handleFinalTranscript(_ transcript: String) async {
         guard !transcript.isEmpty else {
             if !isPaused && !isMuted {
@@ -344,8 +519,8 @@ final class VoiceCallViewModel {
             return
         }
 
-        // Stop speech recognition FIRST to release the audio session
-        speechService.stopListening()
+        // Stop STT first to release the audio session
+        stopActiveSTT()
 
         callState = .processing
         currentTranscript = transcript
@@ -355,17 +530,19 @@ final class VoiceCallViewModel {
             return
         }
 
-        // Wait for speech recognizer to fully release audio routes.
+        // Wait for speech recognizer / recorder to fully release audio routes.
         // SFSpeechRecognizer holds the audio session for ~200-300ms after stopListening().
+        // AVAudioRecorder also needs a moment.
         try? await Task.sleep(for: .milliseconds(400))
 
-        // Pre-configure the audio session to .playback (matching LocalAudioPlayer's
-        // internal configureAudioSession). This must succeed before the player starts.
+        // Pre-configure the audio session to .playback before TTS starts.
         for attempt in 1...3 {
             do {
                 let session = AVAudioSession.sharedInstance()
-                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+                try session.setCategory(.playAndRecord, mode: .voiceChat,
+                                        options: [.defaultToSpeaker, .allowBluetoothA2DP])
                 try session.setActive(true)
+                try session.overrideOutputAudioPort(isSpeakerOn ? .speaker : .none)
                 break
             } catch {
                 logger.warning("Audio session attempt \(attempt)/3: \(error.localizedDescription)")

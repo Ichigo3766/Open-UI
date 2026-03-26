@@ -151,6 +151,21 @@ final class AppDependencyContainer: ServiceContainer {
     /// The folder manager for organising conversations into folders.
     private(set) var folderManager: FolderManager?
 
+    /// The prompt manager for workspace prompt CRUD.
+    private(set) var promptManager: PromptManager?
+
+    /// The knowledge manager for workspace knowledge base CRUD.
+    private(set) var knowledgeManager: KnowledgeManager?
+
+    /// The skills manager for workspace skills CRUD.
+    private(set) var skillsManager: SkillsManager?
+
+    /// The tools manager for workspace tools CRUD.
+    private(set) var toolsManager: ToolsManager?
+
+    /// The model manager for workspace models CRUD.
+    private(set) var modelManager: ModelManager?
+
     /// Persistent store for active chat view models.
     let activeChatStore = ActiveChatStore()
 
@@ -159,8 +174,11 @@ final class AppDependencyContainer: ServiceContainer {
     /// Notification service for local notifications.
     let notificationService = NotificationService.shared
 
-    /// Speech recognition service.
+    /// Speech recognition service (Apple on-device).
     let speechRecognitionService = SpeechRecognitionService()
+
+    /// Server-side speech recognition service (records mic → uploads to /api/v1/audio/transcriptions).
+    let serverSpeechRecognitionService = ServerSpeechRecognitionService()
 
     /// Text-to-speech service.
     let textToSpeechService = TextToSpeechService()
@@ -246,9 +264,15 @@ final class AppDependencyContainer: ServiceContainer {
 
         apiClient = APIClient(serverConfig: config)
         textToSpeechService.configureServerTTS(apiClient: apiClient)
+        serverSpeechRecognitionService.configure(apiClient: apiClient)
         conversationManager = apiClient.map { ConversationManager(apiClient: $0) }
         folderManager = apiClient.map { FolderManager(apiClient: $0) }
         notesManager = NotesManager(apiClient: apiClient)
+        promptManager = apiClient.map { PromptManager(apiClient: $0) }
+        knowledgeManager = apiClient.map { KnowledgeManager(apiClient: $0) }
+        skillsManager = apiClient.map { SkillsManager(apiClient: $0) }
+        toolsManager = apiClient.map { ToolsManager(apiClient: $0) }
+        modelManager = apiClient.map { ModelManager(apiClient: $0) }
 
         let serverHost = URL(string: config.url)?.host
 
@@ -320,12 +344,26 @@ final class AppDependencyContainer: ServiceContainer {
     }
 
     /// Creates a configured VoiceCallViewModel ready for use.
+    /// Picks the live STT service based on the user's `sttEngine` preference:
+    /// - "server" → `ServerSpeechRecognitionService` (records mic → uploads to server)
+    /// - anything else → `SpeechRecognitionService` (Apple on-device)
     func makeVoiceCallViewModel() -> VoiceCallViewModel {
-        VoiceCallViewModel(
-            speechService: speechRecognitionService,
-            ttsService: textToSpeechService,
-            callKitManager: callKitManager
-        )
+        let useServerSTT = UserDefaults.standard.string(forKey: "sttEngine") == "server"
+            && serverSpeechRecognitionService.isAvailable
+
+        if useServerSTT {
+            return VoiceCallViewModel(
+                serverSpeechService: serverSpeechRecognitionService,
+                ttsService: textToSpeechService,
+                callKitManager: callKitManager
+            )
+        } else {
+            return VoiceCallViewModel(
+                speechService: speechRecognitionService,
+                ttsService: textToSpeechService,
+                callKitManager: callKitManager
+            )
+        }
     }
 
     /// Processes any pending shared content from the Share Extension.

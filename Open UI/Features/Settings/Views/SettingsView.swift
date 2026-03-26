@@ -337,11 +337,9 @@ struct SettingsView: View {
     }
 
     private func profileImageURL(for user: User) -> URL? {
-        guard let urlString = user.profileImageURL, !urlString.isEmpty else { return nil }
-        if urlString.hasPrefix("http") {
-            return URL(string: urlString)
-        }
-        return URL(string: "\(viewModel.serverURL)\(urlString)")
+        guard let baseURL = dependencies.apiClient?.baseURL,
+              !user.id.isEmpty, !baseURL.isEmpty else { return nil }
+        return URL(string: "\(baseURL)/api/v1/users/\(user.id)/profile/image")
     }
 }
 
@@ -644,10 +642,17 @@ struct TTSSettingsView: View {
     @AppStorage("ttsEngine") private var selectedEngine: String = "system"
     @AppStorage("ttsMarvisVoice") private var marvisVoice: String = "conversationalA"
     @AppStorage("ttsMarvisQuality") private var marvisQuality: Int = 32
+    @AppStorage("ttsServerVoiceId") private var serverVoiceId: String = ""
     @State private var isSpeaking = false
     @State private var availableVoices: [AVSpeechSynthesisVoice] = []
     @State private var isDownloadingModel = false
     @State private var marvisModelSize: String = "–"
+    @State private var serverVoices: [(id: String, name: String)] = []
+    @State private var isLoadingServerVoices = false
+    /// Model name configured on the server (from /api/v1/audio/config).
+    @State private var serverConfiguredModel: String = ""
+    /// Whether we're currently loading the audio config from the server.
+    @State private var isLoadingServerConfig = false
 
     private var ttsService: TextToSpeechService {
         dependencies.textToSpeechService
@@ -850,6 +855,90 @@ struct TTSSettingsView: View {
                 }
             }
 
+            // Server TTS Settings (shown when server engine is selected)
+            if selectedEngine == "server" && ttsService.isServerAvailable {
+                // --- Model info (from /api/v1/audio/config) ---
+                Section {
+                    if isLoadingServerConfig {
+                        HStack(spacing: Spacing.sm) {
+                            ProgressView().controlSize(.small)
+                            Text("Loading server config…")
+                                .scaledFont(size: 14)
+                                .foregroundStyle(theme.textSecondary)
+                        }
+                    } else {
+                        HStack {
+                            Text("Model")
+                            Spacer()
+                            Text(serverConfiguredModel.isEmpty ? "Not configured" : serverConfiguredModel)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Button {
+                            Task { await loadServerConfig() }
+                        } label: {
+                            HStack(spacing: Spacing.sm) {
+                                Image(systemName: "arrow.clockwise.circle")
+                                    .scaledFont(size: 14, weight: .medium)
+                                Text("Refresh Config")
+                                    .scaledFont(size: 14)
+                            }
+                            .foregroundStyle(theme.brandPrimary)
+                        }
+                    }
+                } header: {
+                    Text("Server TTS Model")
+                } footer: {
+                    Text("The TTS model configured on your OpenWebUI server (/api/v1/audio/config).")
+                }
+
+                // --- Voice picker ---
+                Section {
+                    if isLoadingServerVoices {
+                        HStack(spacing: Spacing.sm) {
+                            ProgressView().controlSize(.small)
+                            Text("Loading voices from server…")
+                                .scaledFont(size: 14)
+                                .foregroundStyle(theme.textSecondary)
+                        }
+                    } else if serverVoices.isEmpty {
+                        HStack {
+                            Text("Voice")
+                            Spacer()
+                            Text(serverVoiceId.isEmpty ? "Server Default" : serverVoiceId)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Button {
+                            Task { await loadServerVoices() }
+                        } label: {
+                            HStack(spacing: Spacing.sm) {
+                                Image(systemName: "arrow.clockwise.circle")
+                                    .scaledFont(size: 14, weight: .medium)
+                                Text("Load Available Voices")
+                                    .scaledFont(size: 14)
+                            }
+                            .foregroundStyle(theme.brandPrimary)
+                        }
+                    } else {
+                        // Voice picker from server
+                        Picker("Voice", selection: $serverVoiceId) {
+                            Text("Server Default").tag("")
+                            ForEach(serverVoices, id: \.id) { voice in
+                                Text(voice.name).tag(voice.id)
+                            }
+                        }
+                        .onChange(of: serverVoiceId) { _, newValue in
+                            ttsService.serverVoiceId = newValue.isEmpty ? nil : newValue
+                        }
+                    }
+                } header: {
+                    Text("Server Voice")
+                } footer: {
+                    Text("Voices available on your OpenWebUI server. The default uses the server's configured voice.")
+                }
+            }
+
             // System Voice Settings (only when system engine is selected)
             if selectedEngine == "system" || selectedEngine == "auto" {
                 Section {
@@ -963,6 +1052,13 @@ struct TTSSettingsView: View {
             syncMarvisConfig()
             refreshMarvisModelSize()
         }
+        .task {
+            // Always fetch fresh config from server when the user opens this screen
+            if ttsService.isServerAvailable {
+                await loadServerConfig()
+                await loadServerVoices()
+            }
+        }
     }
 
     // MARK: - Marvis Status Badge
@@ -1022,6 +1118,57 @@ struct TTSSettingsView: View {
         let service = dependencies.textToSpeechService
         service.speechRate = Float(speechRate) * AVSpeechUtteranceDefaultSpeechRate
         service.voiceIdentifier = voiceIdentifier.isEmpty ? nil : voiceIdentifier
+        service.serverVoiceId = serverVoiceId.isEmpty ? nil : serverVoiceId
+    }
+
+    /// Fetches the server's audio config from `/api/v1/audio/config`.
+    /// Always stores the server-configured default voice so it can be used as
+    /// the fallback when the user selects "Server Default" in the picker.
+    @MainActor
+    private func loadServerConfig() async {
+        guard let apiClient = dependencies.apiClient else { return }
+        isLoadingServerConfig = true
+        defer { isLoadingServerConfig = false }
+        do {
+            let config = try await apiClient.getAudioConfig()
+            // Parse tts.MODEL for the model name display
+            if let tts = config["tts"] as? [String: Any] {
+                let model = (tts["MODEL"] as? String) ?? ""
+                serverConfiguredModel = model
+
+                // Always store the server-configured voice as the fallback default.
+                // When the user picks "Server Default" (empty serverVoiceId) we send
+                // this voice to the API so the server honours the admin configuration.
+                let configVoice = (tts["VOICE"] as? String) ?? ""
+                if !configVoice.isEmpty {
+                    ttsService.serverDefaultVoice = configVoice
+                    // If user hasn't manually chosen a voice, apply it automatically
+                    if serverVoiceId.isEmpty {
+                        ttsService.serverVoiceId = configVoice
+                    }
+                }
+            }
+        } catch {
+            // Non-critical — keep whatever was there before
+        }
+    }
+
+    /// Fetches available voices from the server's `/api/v1/audio/voices` endpoint.
+    @MainActor
+    private func loadServerVoices() async {
+        guard let apiClient = dependencies.apiClient else { return }
+        isLoadingServerVoices = true
+        defer { isLoadingServerVoices = false }
+        do {
+            let raw = try await apiClient.getVoices()
+            serverVoices = raw.compactMap { entry -> (id: String, name: String)? in
+                guard let id = entry["id"] as? String else { return nil }
+                let name = entry["name"] as? String ?? id
+                return (id: id, name: name)
+            }
+        } catch {
+            // Non-critical — leave serverVoices empty so the fallback text input shows
+        }
     }
 
     private func syncEngineToService() {

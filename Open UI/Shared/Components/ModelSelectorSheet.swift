@@ -117,10 +117,10 @@ struct ModelSelectorSheet: View {
             filteredModels = models
             prefetchAvatars()
         }
-        .onChange(of: searchText) { _ in scheduleFilter() }
-        .onChange(of: selectedTag) { _ in applyFilters() }
-        .onChange(of: selectedConnection) { _ in applyFilters() }
-        .onChange(of: models) { _ in applyFilters(); prefetchAvatars() }
+        .onChange(of: searchText) { scheduleFilter() }
+        .onChange(of: selectedTag) { applyFilters() }
+        .onChange(of: selectedConnection) { applyFilters() }
+        .onChange(of: models) { applyFilters(); prefetchAvatars() }
     }
 
     // MARK: - Sheet Header

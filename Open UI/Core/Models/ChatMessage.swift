@@ -103,7 +103,7 @@ struct ChatMessageFile: Codable, Hashable, Sendable {
     var contentType: String?
 }
 
-struct ChatMessage: Codable, Identifiable, Hashable, Sendable {
+struct ChatMessage: Identifiable, Hashable, Sendable {
     let id: String
     var role: MessageRole
     var content: String
@@ -118,6 +118,16 @@ struct ChatMessage: Codable, Identifiable, Hashable, Sendable {
     var metadata: [String: String]?
     var error: ChatMessageError?
     var versions: [ChatMessageVersion]
+    /// Token usage data returned by the server after generation completes.
+    /// Stored as a raw dictionary so any provider-specific fields are preserved
+    /// regardless of model (OpenAI, Anthropic, Ollama, etc. all differ).
+    var usage: [String: Any]?
+    /// Rich UI HTML embeds stored at the message level by the server.
+    /// OpenWebUI stores embeds here when the tool call's `<details>` block
+    /// has an empty `embeds=""` attribute — the HTML is instead placed on the
+    /// message object itself. The iOS app renders these via `RichUIEmbedView`
+    /// (the same WKWebView path used for tool-level embeds).
+    var embeds: [String]
 
     init(
         id: String = UUID().uuidString,
@@ -133,7 +143,9 @@ struct ChatMessage: Codable, Identifiable, Hashable, Sendable {
         followUps: [String] = [],
         metadata: [String: String]? = nil,
         error: ChatMessageError? = nil,
-        versions: [ChatMessageVersion] = []
+        versions: [ChatMessageVersion] = [],
+        usage: [String: Any]? = nil,
+        embeds: [String] = []
     ) {
         self.id = id
         self.role = role
@@ -149,6 +161,8 @@ struct ChatMessage: Codable, Identifiable, Hashable, Sendable {
         self.metadata = metadata
         self.error = error
         self.versions = versions
+        self.usage = usage
+        self.embeds = embeds
     }
 
     /// O(1) equality check — uses `content.utf8.count` instead of full string
@@ -166,6 +180,7 @@ struct ChatMessage: Codable, Identifiable, Hashable, Sendable {
             && lhs.files.count == rhs.files.count
             && lhs.error?.content == rhs.error?.content
             && lhs.versions.count == rhs.versions.count
+            && (lhs.usage == nil) == (rhs.usage == nil)
     }
 
     func hash(into hasher: inout Hasher) {
@@ -175,6 +190,125 @@ struct ChatMessage: Codable, Identifiable, Hashable, Sendable {
         hasher.combine(followUps.count)
         hasher.combine(files.count)
         hasher.combine(versions.count)
+    }
+}
+
+// MARK: - ChatMessage Codable
+
+extension ChatMessage: Codable {
+    enum CodingKeys: String, CodingKey {
+        case id, role, content, timestamp, model, isStreaming
+        case attachmentIds, files, sources, statusHistory, followUps
+        case metadata, error, versions, usage
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id            = try c.decode(String.self, forKey: .id)
+        role          = try c.decode(MessageRole.self, forKey: .role)
+        content       = try c.decode(String.self, forKey: .content)
+        timestamp     = try c.decode(Date.self, forKey: .timestamp)
+        model         = try c.decodeIfPresent(String.self, forKey: .model)
+        isStreaming   = (try? c.decode(Bool.self, forKey: .isStreaming)) ?? false
+        attachmentIds = (try? c.decode([String].self, forKey: .attachmentIds)) ?? []
+        files         = (try? c.decode([ChatMessageFile].self, forKey: .files)) ?? []
+        sources       = (try? c.decode([ChatSourceReference].self, forKey: .sources)) ?? []
+        statusHistory = (try? c.decode([ChatStatusUpdate].self, forKey: .statusHistory)) ?? []
+        followUps     = (try? c.decode([String].self, forKey: .followUps)) ?? []
+        metadata      = try? c.decodeIfPresent([String: String].self, forKey: .metadata)
+        error         = try? c.decodeIfPresent(ChatMessageError.self, forKey: .error)
+        versions      = (try? c.decode([ChatMessageVersion].self, forKey: .versions)) ?? []
+        // usage is [String: Any] — decode via JSONSerialization-backed AnyCodable bridge
+        if let usageData = try? c.decodeIfPresent(AnyCodableMap.self, forKey: .usage) {
+            usage = usageData.value
+        } else {
+            usage = nil
+        }
+        // embeds are not persisted — they come from the server JSON on each load.
+        embeds = []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(role, forKey: .role)
+        try c.encode(content, forKey: .content)
+        try c.encode(timestamp, forKey: .timestamp)
+        try c.encodeIfPresent(model, forKey: .model)
+        try c.encode(isStreaming, forKey: .isStreaming)
+        try c.encode(attachmentIds, forKey: .attachmentIds)
+        try c.encode(files, forKey: .files)
+        try c.encode(sources, forKey: .sources)
+        try c.encode(statusHistory, forKey: .statusHistory)
+        try c.encode(followUps, forKey: .followUps)
+        try c.encodeIfPresent(metadata, forKey: .metadata)
+        try c.encodeIfPresent(error, forKey: .error)
+        try c.encode(versions, forKey: .versions)
+        if let usage {
+            try c.encode(AnyCodableMap(usage), forKey: .usage)
+        }
+    }
+}
+
+// MARK: - AnyCodableMap (bridges [String: Any] ↔ Codable)
+
+/// A lightweight Codable wrapper around `[String: Any]` that handles
+/// nested dictionaries, arrays, numbers, booleans and strings.
+/// Used exclusively for persisting/restoring `ChatMessage.usage`.
+struct AnyCodableMap: Codable {
+    let value: [String: Any]
+
+    init(_ value: [String: Any]) { self.value = value }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        value = (try? container.decode([String: AnyDecodable].self))?.mapValues(\.value) ?? [:]
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        let encodable = value.mapValues { AnyEncodable($0) }
+        try container.encode(encodable)
+    }
+}
+
+// Decoding helper
+private struct AnyDecodable: Decodable {
+    let value: Any
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let v = try? c.decode(Bool.self)   { value = v; return }
+        if let v = try? c.decode(Int.self)    { value = v; return }
+        if let v = try? c.decode(Double.self) { value = v; return }
+        if let v = try? c.decode(String.self) { value = v; return }
+        if let v = try? c.decode([String: AnyDecodable].self) {
+            value = v.mapValues(\.value); return
+        }
+        if let v = try? c.decode([AnyDecodable].self) {
+            value = v.map(\.value); return
+        }
+        value = NSNull()
+    }
+}
+
+// Encoding helper
+private struct AnyEncodable: Encodable {
+    let wrapped: Any
+    init(_ value: Any) { wrapped = value }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch wrapped {
+        case let v as Bool:           try c.encode(v)
+        case let v as Int:            try c.encode(v)
+        case let v as Double:         try c.encode(v)
+        case let v as Float:          try c.encode(Double(v))
+        case let v as String:         try c.encode(v)
+        case let v as [String: Any]:  try c.encode(v.mapValues { AnyEncodable($0) })
+        case let v as [Any]:          try c.encode(v.map { AnyEncodable($0) })
+        default:                      try c.encodeNil()
+        }
     }
 }
 

@@ -94,8 +94,26 @@ final class ConversationManager: @unchecked Sendable {
         try await apiClient.shareConversation(id: id)
     }
 
+    func unshareConversation(id: String) async throws {
+        try await apiClient.unshareConversation(id: id)
+    }
+
     func cloneConversation(id: String) async throws -> Conversation {
         try await apiClient.cloneConversation(id: id)
+    }
+
+    // MARK: - Archive / Shared Chat Browsing
+
+    func fetchArchivedChats(page: Int = 1, query: String? = nil) async throws -> [Conversation] {
+        try await apiClient.getArchivedChats(page: page, query: query)
+    }
+
+    func unarchiveAllConversations() async throws {
+        try await apiClient.unarchiveAllConversations()
+    }
+
+    func fetchSharedChats(page: Int = 1) async throws -> [Conversation] {
+        try await apiClient.getSharedChats(page: page)
     }
 
     // MARK: - Models
@@ -174,6 +192,20 @@ final class ConversationManager: @unchecked Sendable {
 
     func uploadFile(data: Data, fileName: String, onUploaded: ((String) -> Void)? = nil) async throws -> String {
         try await apiClient.uploadFile(data: data, fileName: fileName, onUploaded: onUploaded)
+    }
+
+    /// Uploads a file without triggering individual server-side processing.
+    /// Returns the raw file object (id, filename, etc.) needed by the batch endpoint.
+    func uploadFileOnly(data: Data, fileName: String) async throws -> [String: Any] {
+        try await apiClient.uploadFileOnly(data: data, fileName: fileName)
+    }
+
+    /// Sends a set of already-uploaded file objects to the batch processing endpoint.
+    func processFilesBatch(
+        fileObjects: [[String: Any]],
+        collectionName: String
+    ) async throws -> (successes: [String], errors: [(fileId: String, error: String?)]) {
+        try await apiClient.processFilesBatch(fileObjects: fileObjects, collectionName: collectionName)
     }
 
     // MARK: - Knowledge

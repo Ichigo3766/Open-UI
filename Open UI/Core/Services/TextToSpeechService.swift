@@ -63,6 +63,14 @@ final class TextToSpeechService: NSObject {
     var isServerAvailable: Bool { apiClient != nil }
     private(set) var apiClient: APIClient?
 
+    /// The voice configured on the server (from /api/v1/audio/config tts.VOICE).
+    /// Used as the fallback when the user selects "Server Default" (serverVoiceId == nil).
+    var serverDefaultVoice: String?
+
+    /// When set to true, output is forced to the loudspeaker after each audio session setup.
+    /// Set by VoiceCallViewModel to persist speaker routing through the TTS pipeline.
+    var speakerOverrideEnabled: Bool = false
+
     func configureServerTTS(apiClient: APIClient?) {
         self.apiClient = apiClient
     }
@@ -81,6 +89,14 @@ final class TextToSpeechService: NSObject {
     private var serverQueue: [String] = []
     private var isRunningServerQueue = false
     private var serverAudioPlayer: AVAudioPlayer?
+
+    // Server TTS prefetch pipeline
+    /// Max number of audio chunks to fetch ahead of the currently playing chunk.
+    private let serverPrefetchCount = 2
+    /// Buffer of pre-fetched audio players ready to play (FIFO).
+    private var prefetchedPlayers: [AVAudioPlayer] = []
+    /// Background task that keeps the prefetch buffer filled.
+    private var prefetchTask: Task<Void, Never>?
 
     // Active engine flags
     private var isUsingMarvis = false
@@ -109,6 +125,17 @@ final class TextToSpeechService: NSObject {
             default:              preferredEngine = .auto
             }
         }
+
+        // Restore saved server voice selection
+        let savedServerVoice = UserDefaults.standard.string(forKey: "ttsServerVoiceId") ?? ""
+        serverVoiceId = savedServerVoice.isEmpty ? nil : savedServerVoice
+
+        // Restore Marvis voice & quality from UserDefaults so the user's
+        // selection survives cold starts / model unload-reload cycles.
+        let savedMarvisVoice = UserDefaults.standard.string(forKey: "ttsMarvisVoice") ?? "conversationalA"
+        let savedMarvisQuality = UserDefaults.standard.integer(forKey: "ttsMarvisQuality")
+        marvisService.config.voice = savedMarvisVoice
+        marvisService.config.qualityLevel = savedMarvisQuality > 0 ? savedMarvisQuality : 32
 
         // Wire MarvisTTS callbacks
         marvisService.onSpeakingStarted = { [weak self] in
@@ -192,7 +219,13 @@ final class TextToSpeechService: NSObject {
         marvisService.stop()
         isUsingMarvis = false
 
-        // Stop server TTS
+        // Stop server TTS — cancel prefetch and clear all buffers
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        for player in prefetchedPlayers {
+            player.stop()
+        }
+        prefetchedPlayers.removeAll()
         serverAudioPlayer?.stop()
         serverAudioPlayer = nil
         serverQueue.removeAll()
@@ -209,6 +242,9 @@ final class TextToSpeechService: NSObject {
         streamingSpokenLength = 0
 
         state = .idle
+
+        // Deactivate audio session to release hardware resources
+        deactivateAudioSession()
     }
 
     func pause() {
@@ -276,6 +312,10 @@ final class TextToSpeechService: NSObject {
         marvisService.stop()
         isUsingMarvis = false
 
+        prefetchTask?.cancel()
+        prefetchTask = nil
+        prefetchedPlayers.forEach { $0.stop() }
+        prefetchedPlayers.removeAll()
         serverAudioPlayer?.stop()
         serverAudioPlayer = nil
         serverQueue.removeAll()
@@ -388,68 +428,152 @@ final class TextToSpeechService: NSObject {
         let sentences = TTSTextPreprocessor.splitIntoSentences(text)
         serverQueue.append(contentsOf: sentences)
         if !isRunningServerQueue {
-            Task { await processServerQueue() }
+            isRunningServerQueue = true
+            startServerPipeline()
         }
     }
 
-    private func processServerQueue() async {
-        guard !serverQueue.isEmpty else {
-            isRunningServerQueue = false
-            isUsingServer = false
-            if !isStreamingTTS {
-                state = .idle
-                onComplete?()
-            }
-            return
-        }
-
-        isRunningServerQueue = true
-        let chunk = serverQueue.removeFirst()
-
+    /// Starts the two-stage server TTS pipeline:
+    /// - **Producer** (prefetchTask): fetches audio from the server up to `serverPrefetchCount`
+    ///   chunks ahead and stores ready-to-play `AVAudioPlayer` instances in `prefetchedPlayers`.
+    /// - **Consumer** (this task): plays from `prefetchedPlayers`, popping the front player
+    ///   as soon as the previous one finishes, giving seamless gapless playback.
+    private func startServerPipeline() {
         guard let apiClient else {
             logger.error("Server TTS: no API client, falling back to system")
             isRunningServerQueue = false
             isUsingServer = false
-            let remaining = ([chunk] + serverQueue).joined(separator: " ")
+            let remaining = serverQueue.joined(separator: " ")
             serverQueue.removeAll()
             speakWithSystem(remaining)
             return
         }
 
-        do {
-            let (audioData, _) = try await apiClient.generateSpeech(
-                text: chunk,
-                voice: serverVoiceId
-            )
+        // Resolve the effective voice: user override → server config default → nil
+        // When nil, the API falls back to whatever its own built-in default is,
+        // which may NOT match the admin-configured voice. By explicitly sending
+        // the server-configured voice we honour the admin's choice.
+        let voiceId = serverVoiceId ?? serverDefaultVoice
+        let speakerOverride = speakerOverrideEnabled
 
+        // --- Producer: fill prefetch buffer up to serverPrefetchCount ahead ---
+        prefetchTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                // Pull next text chunk from the queue (must happen on MainActor)
+                let chunk: String? = await MainActor.run {
+                    guard !self.serverQueue.isEmpty else { return nil }
+                    return self.serverQueue.removeFirst()
+                }
+
+                guard let text = chunk else {
+                    // Queue empty — wait briefly for more chunks (streaming may add them)
+                    try? await Task.sleep(for: .milliseconds(80))
+                    let stillEmpty = await MainActor.run { self.serverQueue.isEmpty }
+                    if stillEmpty { break }
+                    continue
+                }
+
+                // Throttle: don't get too far ahead of the consumer
+                while !Task.isCancelled {
+                    let bufferSize = await MainActor.run { self.prefetchedPlayers.count }
+                    if bufferSize < self.serverPrefetchCount { break }
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                guard !Task.isCancelled else { break }
+
+                do {
+                    let (audioData, _) = try await apiClient.generateSpeech(
+                        text: text,
+                        voice: voiceId
+                    )
+                    let player = try AVAudioPlayer(data: audioData)
+                    player.prepareToPlay()
+                    // Deposit into buffer on MainActor
+                    await MainActor.run {
+                        if !Task.isCancelled {
+                            self.prefetchedPlayers.append(player)
+                        }
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.logger.error("Server TTS prefetch failed: \(error.localizedDescription)")
+                    }
+                    // On error skip this chunk and continue
+                }
+            }
+        }
+
+        // --- Consumer: play from prefetch buffer continuously ---
+        Task { [weak self] in
+            guard let self else { return }
+
+            // Configure audio session once before starting playback
             let session = AVAudioSession.sharedInstance()
-            try? session.setCategory(.playAndRecord, mode: .voiceChat,
-                                     options: [.defaultToSpeaker, .allowBluetoothA2DP])
-            try? session.setActive(true)
-
-            let player = try AVAudioPlayer(data: audioData)
-            self.serverAudioPlayer = player
-            player.prepareToPlay()
-            player.play()
-
-            while player.isPlaying {
-                try? await Task.sleep(for: .milliseconds(50))
+            if speakerOverride {
+                try? session.setCategory(.playAndRecord, mode: .voiceChat,
+                                         options: [.defaultToSpeaker, .allowBluetoothA2DP])
+                try? session.setActive(true)
+                try? session.overrideOutputAudioPort(.speaker)
+            } else {
+                try? session.setCategory(.playback, mode: .default)
+                try? session.setActive(true)
             }
 
-            await processServerQueue()
-        } catch {
-            logger.error("Server TTS chunk failed: \(error.localizedDescription)")
-            isRunningServerQueue = false
-            isUsingServer = false
+            var playedAtLeastOne = false
 
-            if preferredEngine == .auto {
-                let remaining = serverQueue.joined(separator: " ")
-                serverQueue.removeAll()
-                if !remaining.isEmpty { speakWithSystem(remaining) }
-            } else {
-                serverQueue.removeAll()
-                state = .idle
-                onError?("Server TTS failed: \(error.localizedDescription)")
+            // Keep playing until the buffer is empty AND the producer is done
+            while true {
+                // Pop next player from front of buffer
+                let player: AVAudioPlayer? = await MainActor.run {
+                    guard !self.prefetchedPlayers.isEmpty else { return nil }
+                    return self.prefetchedPlayers.removeFirst()
+                }
+
+                if let player {
+                    playedAtLeastOne = true
+                    self.serverAudioPlayer = player
+                    player.play()
+                    while player.isPlaying {
+                        try? await Task.sleep(for: .milliseconds(30))
+                    }
+                    // Release finished player immediately to free memory
+                    player.stop()
+                    await MainActor.run { self.serverAudioPlayer = nil }
+                } else {
+                    // Buffer empty — check if producer is still running
+                    let producerDone = await MainActor.run {
+                        self.prefetchTask?.isCancelled ?? true
+                    }
+                    let queueEmpty = await MainActor.run { self.serverQueue.isEmpty }
+
+                    if producerDone || queueEmpty {
+                        // Give producer a brief moment to deposit last chunk
+                        try? await Task.sleep(for: .milliseconds(120))
+                        let stillEmpty = await MainActor.run { self.prefetchedPlayers.isEmpty }
+                        if stillEmpty { break }
+                    } else {
+                        // Producer still working — wait for next chunk
+                        try? await Task.sleep(for: .milliseconds(30))
+                    }
+                }
+            }
+
+            // All chunks played (or stop() was called)
+            await MainActor.run {
+                self.prefetchTask?.cancel()
+                self.prefetchTask = nil
+                self.serverAudioPlayer = nil
+                self.isRunningServerQueue = false
+                self.isUsingServer = false
+
+                if !self.isStreamingTTS {
+                    self.state = .idle
+                    self.deactivateAudioSession()
+                    if playedAtLeastOne {
+                        self.onComplete?()
+                    }
+                }
             }
         }
     }
@@ -468,6 +592,7 @@ final class TextToSpeechService: NSObject {
             isSpeakingSystemChunk = false
             if !isStreamingTTS && !isUsingMarvis && !isUsingServer {
                 state = .idle
+                deactivateAudioSession()
                 onComplete?()
             }
             return
@@ -493,9 +618,17 @@ final class TextToSpeechService: NSObject {
 
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                    options: [.defaultToSpeaker, .allowBluetoothA2DP])
-            try session.setActive(true)
+            if speakerOverrideEnabled {
+                // Voice call — keep mic+speaker active and force loudspeaker
+                try session.setCategory(.playAndRecord, mode: .voiceChat,
+                                        options: [.defaultToSpeaker, .allowBluetoothA2DP])
+                try session.setActive(true)
+                try session.overrideOutputAudioPort(.speaker)
+            } else {
+                // Regular read-aloud — use playback mode which routes to loudspeaker by default
+                try session.setCategory(.playback, mode: .default)
+                try session.setActive(true)
+            }
         } catch {
             logger.warning("Audio session config skipped: \(error.localizedDescription)")
         }
@@ -505,6 +638,17 @@ final class TextToSpeechService: NSObject {
         if systemQueue.isEmpty { onStart?() }
 
         synthesizer.speak(utterance)
+    }
+
+    // MARK: - Audio Session Management
+
+    /// Deactivates the shared audio session to release hardware resources.
+    /// Called after all TTS playback finishes (both natural completion and stop()).
+    private func deactivateAudioSession() {
+        try? AVAudioSession.sharedInstance().setActive(
+            false,
+            options: .notifyOthersOnDeactivation
+        )
     }
 
     // MARK: - Chunk Enqueuing (used by streaming TTS)
@@ -518,7 +662,8 @@ final class TextToSpeechService: NSObject {
             isUsingServer = true
             serverQueue.append(chunk)
             if !isRunningServerQueue {
-                Task { await processServerQueue() }
+                isRunningServerQueue = true
+                startServerPipeline()
             }
         case .system, .auto:
             systemQueue.append(chunk)

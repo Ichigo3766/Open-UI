@@ -12,7 +12,7 @@ final class SharedDataService: Sendable {
     static let shared = SharedDataService()
 
     /// The App Group identifier. Must match the entitlements configuration.
-    static let appGroupId = "group.com.abhiinnovate.Open-UI"
+    static let appGroupId = "group.com.openui.openui"
 
     private let logger = Logger(subsystem: "com.openui", category: "SharedData")
     private let defaults: UserDefaults?

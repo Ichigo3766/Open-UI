@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.openui.streaming</string>
+		<string>com.openui.asr.transcription</string>
+	</array>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>All Files</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.data</string>
+				<string>public.content</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.openui.openui</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>openui</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>UIApplicationShortcutItems</key>
+	<array>
+		<dict>
+			<key>UIApplicationShortcutItemIconSymbolName</key>
+			<string>bubble.left.and.bubble.right.fill</string>
+			<key>UIApplicationShortcutItemTitle</key>
+			<string>New Chat</string>
+			<key>UIApplicationShortcutItemType</key>
+			<string>com.openui.openui.new-chat</string>
+			<key>UIApplicationShortcutItemUserInfo</key>
+			<dict>
+				<key>url</key>
+				<string>openui://new-chat</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>UIApplicationShortcutItemIconSymbolName</key>
+			<string>mic.fill</string>
+			<key>UIApplicationShortcutItemTitle</key>
+			<string>Voice Call</string>
+			<key>UIApplicationShortcutItemType</key>
+			<string>com.openui.openui.voice-call</string>
+			<key>UIApplicationShortcutItemUserInfo</key>
+			<dict>
+				<key>url</key>
+				<string>openui://voice-call</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>UIApplicationShortcutItemIconSymbolName</key>
+			<string>camera.fill</string>
+			<key>UIApplicationShortcutItemTitle</key>
+			<string>Camera Chat</string>
+			<key>UIApplicationShortcutItemType</key>
+			<string>com.openui.openui.camera-chat</string>
+			<key>UIApplicationShortcutItemUserInfo</key>
+			<dict>
+				<key>url</key>
+				<string>openui://camera-chat</string>
+			</dict>
+		</dict>
+		<dict>
+			<key>UIApplicationShortcutItemIconSymbolName</key>
+			<string>number</string>
+			<key>UIApplicationShortcutItemTitle</key>
+			<string>New Channel</string>
+			<key>UIApplicationShortcutItemType</key>
+			<string>com.openui.openui.new-channel</string>
+			<key>UIApplicationShortcutItemUserInfo</key>
+			<dict>
+				<key>url</key>
+				<string>openui://new-channel</string>
+			</dict>
+		</dict>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Open Relay Chat Item</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.openui.chat-item</string>
+		</dict>
+	</array>
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict/>
+	</array>
+</dict>
+</plist>

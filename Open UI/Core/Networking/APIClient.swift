@@ -499,6 +499,15 @@ final class APIClient: @unchecked Sendable {
 
         let connectionType = raw["connection_type"] as? String
 
+        // Detect pipe/function models — server sets raw["pipe"] = {"type": "pipe"}
+        let isPipeModel = raw["pipe"] != nil
+
+        // Extract filter IDs — server sends raw["filters"] = [{"id": "...", ...}]
+        let filterIds: [String] = {
+            guard let filters = raw["filters"] as? [[String: Any]] else { return [] }
+            return filters.compactMap { $0["id"] as? String }
+        }()
+
         return AIModel(
             id: id,
             name: name,
@@ -514,7 +523,10 @@ final class APIClient: @unchecked Sendable {
             functionCallingMode: functionCallingMode,
             builtinTools: builtinTools,
             tags: tags,
-            connectionType: connectionType
+            connectionType: connectionType,
+            isPipeModel: isPipeModel,
+            filterIds: filterIds,
+            rawModelItem: raw
         )
     }
 
@@ -795,6 +807,27 @@ final class APIClient: @unchecked Sendable {
         return [:]
     }
 
+    /// Sends a pipe-model chat completion request and streams the SSE response
+    /// directly from the HTTP response body.
+    ///
+    /// Pipe/function models in OpenWebUI bypass the Redis async-task queue when
+    /// `session_id`, `chat_id`, and `id` are absent from the request. Instead,
+    /// they stream their output as standard OpenAI-format SSE in the HTTP response
+    /// body. This method posts the request and returns the live `SSEStream` for
+    /// the caller to iterate over.
+    ///
+    /// - Parameter request: A `ChatCompletionRequest` with `isPipeModel == true`
+    ///   and `stream == true`. The `toJSON()` call omits the three Redis-triggering
+    ///   fields automatically.
+    /// - Returns: An `SSEStream` that yields tokens as they arrive.
+    func sendMessagePipeSSE(request: ChatCompletionRequest) async throws -> SSEStream {
+        try await network.streamRequestBytes(
+            path: "/api/chat/completions",
+            method: .post,
+            body: request.toJSON()
+        )
+    }
+
     func syncConversationMessages(
         id: String,
         messages: [ChatMessage],
@@ -815,6 +848,8 @@ final class APIClient: @unchecked Sendable {
         )
     }
 
+    /// Posts to `/api/chat/completed` to trigger server-side post-processing
+    /// (filter pipelines, usage tracking, background tasks). Fire-and-forget.
     func sendChatCompleted(
         chatId: String,
         messageId: String,
@@ -834,11 +869,15 @@ final class APIClient: @unchecked Sendable {
             body["filter_ids"] = filterIds
         }
 
-        try? await network.requestVoidJSON(
-            path: "/api/chat/completed",
-            method: .post,
-            body: body
-        )
+        do {
+            _ = try await network.requestJSON(
+                path: "/api/chat/completed",
+                method: .post,
+                body: body
+            )
+        } catch {
+            logger.warning("sendChatCompleted failed: \(error.localizedDescription)")
+        }
     }
 
     func stopTask(taskId: String) async throws {
@@ -1082,6 +1121,7 @@ final class APIClient: @unchecked Sendable {
     func uploadFile(
         data fileData: Data,
         fileName: String,
+        knowledgeId: String? = nil,
         onUploaded: ((String) -> Void)? = nil
     ) async throws -> String {
         let mime = mimeType(for: fileName)
@@ -1091,12 +1131,20 @@ final class APIClient: @unchecked Sendable {
             URLQueryItem(name: "process", value: "true")
         ]
 
+        // Per the API spec, attach knowledge_id as a metadata field in the multipart body
+        // so the server can associate the file with the knowledge base during upload.
+        var additionalFields: [String: String]? = nil
+        if let knowledgeId {
+            additionalFields = ["metadata": "{\"knowledge_id\":\"\(knowledgeId)\"}"]
+        }
+
         let response = try await network.uploadMultipart(
             path: "/api/v1/files/",
             queryItems: queryItems,
             fileData: fileData,
             fileName: fileName,
             mimeType: mime,
+            additionalFields: additionalFields,
             timeout: 300
         )
 
@@ -1209,6 +1257,59 @@ final class APIClient: @unchecked Sendable {
         logger.info("File \(fileId) processing stream ended (assuming completed)")
     }
 
+    // MARK: - Batch File Processing
+
+    /// Uploads a single file to the server **without** triggering individual processing.
+    /// Returns the full file object (id + filename + user_id) needed by the batch endpoint.
+    func uploadFileOnly(
+        data fileData: Data,
+        fileName: String
+    ) async throws -> [String: Any] {
+        let mime = mimeType(for: fileName)
+        return try await network.uploadMultipart(
+            path: "/api/v1/files/",
+            fileData: fileData,
+            fileName: fileName,
+            mimeType: mime,
+            timeout: 300
+        )
+    }
+
+    /// Sends a batch of already-uploaded files to the server for retrieval processing.
+    ///
+    /// `POST /api/v1/retrieval/process/files/batch`
+    ///
+    /// - Parameters:
+    ///   - fileObjects: Array of file metadata dicts returned by `uploadFileOnly` (must contain "id", "filename", "user_id").
+    ///   - collectionName: The vector-store collection to index the files into.
+    /// - Returns: A tuple of (successfulFileIds, failedResults).
+    func processFilesBatch(
+        fileObjects: [[String: Any]],
+        collectionName: String
+    ) async throws -> (successes: [String], errors: [(fileId: String, error: String?)]) {
+        let body: [String: Any] = [
+            "files": fileObjects,
+            "collection_name": collectionName
+        ]
+
+        let responseData = try await network.requestJSON(
+            path: "/api/v1/retrieval/process/files/batch",
+            method: .post,
+            body: body
+        )
+
+        let results = responseData["results"] as? [[String: Any]] ?? []
+        let errorResults = responseData["errors"] as? [[String: Any]] ?? []
+
+        let successIds = results.compactMap { $0["file_id"] as? String }
+        let failures: [(fileId: String, error: String?)] = errorResults.compactMap { dict in
+            guard let fileId = dict["file_id"] as? String else { return nil }
+            return (fileId: fileId, error: dict["error"] as? String)
+        }
+
+        return (successes: successIds, errors: failures)
+    }
+
     func getFileInfo(id: String) async throws -> [String: Any] {
         try await network.requestJSON(path: "/api/v1/files/\(id)")
     }
@@ -1248,14 +1349,29 @@ final class APIClient: @unchecked Sendable {
     func generateSpeech(text: String, voice: String? = nil) async throws -> (Data, String) {
         var body: [String: Any] = ["input": text]
         if let voice { body["voice"] = voice }
+        // Request WAV format to eliminate MP3 encoder-delay artifacts that cause
+        // audible noise at the start of each chunk. WAV has zero codec padding,
+        // so AVAudioPlayer plays it cleanly from the first sample.
+        body["response_format"] = "wav"
 
         let bodyData = try JSONSerialization.data(withJSONObject: body)
+
+        // Log the exact request body being sent
+        if let bodyString = String(data: bodyData, encoding: .utf8) {
+            logger.info("🔊 [TTS] POST /api/v1/audio/speech — body: \(bodyString)")
+        }
+        logger.info("🔊 [TTS] input text (\(text.count) chars): \"\(String(text.prefix(200)))\"")
+        logger.info("🔊 [TTS] voice: \(voice ?? "<nil — using server default>")")
+
         let (data, response) = try await network.requestRaw(
             path: "/api/v1/audio/speech",
             method: .post,
             body: bodyData
         )
         let contentType = response.value(forHTTPHeaderField: "Content-Type") ?? "audio/mpeg"
+
+        logger.info("🔊 [TTS] Response: \(contentType), \(data.count) bytes")
+
         return (data, contentType)
     }
 
@@ -1325,17 +1441,669 @@ final class APIClient: @unchecked Sendable {
     // MARK: - Prompts
 
     func getPrompts() async throws -> [[String: Any]] {
-        let (data, _) = try await network.requestRaw(path: "/api/v1/prompts/")
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/prompts/list",
+            queryItems: [URLQueryItem(name: "page", value: "1")]
+        )
+        let json = try JSONSerialization.jsonObject(with: data)
+        // New server versions return paginated {"items": [...], "total": N}
+        if let dict = json as? [String: Any], let items = dict["items"] as? [[String: Any]] {
+            return items
+        }
+        // Fallback: old flat array response
+        if let array = json as? [[String: Any]] {
+            return array
+        }
+        return []
+    }
+
+    func getPromptTags() async throws -> [String] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/prompts/tags")
+        guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return array.compactMap { $0["name"] as? String }
+    }
+
+    func createPrompt(payload: [String: Any]) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/prompts/create",
+            method: .post,
+            body: payload
+        )
+    }
+
+    func getPromptById(_ id: String) async throws -> [String: Any] {
+        return try await network.requestJSON(path: "/api/v1/prompts/id/\(id)")
+    }
+
+    func updatePrompt(id: String, payload: [String: Any]) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/prompts/id/\(id)/update",
+            method: .post,
+            body: payload
+        )
+    }
+
+    /// Updates prompt access grants. Pass an empty array to make the prompt private (owner-only).
+    @discardableResult
+    func updatePromptAccessGrants(id: String, grants: [[String: Any]]) async throws -> [String: Any] {
+        let body: [String: Any] = ["access_grants": grants]
+        return try await network.requestJSON(
+            path: "/api/v1/prompts/id/\(id)/access/update",
+            method: .post,
+            body: body
+        )
+    }
+
+    func togglePrompt(id: String) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/prompts/id/\(id)/toggle",
+            method: .post,
+            body: [:]
+        )
+    }
+
+    func deletePrompt(id: String) async throws {
+        try await network.requestVoid(
+            path: "/api/v1/prompts/id/\(id)/delete",
+            method: .delete
+        )
+    }
+
+    func getPromptHistory(id: String) async throws -> [[String: Any]] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/prompts/id/\(id)/history")
         guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             return []
         }
         return array
     }
 
+    /// Sets a specific history version as the production (live) version.
+    /// POST /api/v1/prompts/id/{id}/update/version  body: {"version_id": "..."}
+    @discardableResult
+    func setPromptVersion(id: String, versionId: String) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/prompts/id/\(id)/update/version",
+            method: .post,
+            body: ["version_id": versionId]
+        )
+    }
+
+    // MARK: - Knowledge CRUD
+
+    func createKnowledge(payload: [String: Any]) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/knowledge/create",
+            method: .post,
+            body: payload
+        )
+    }
+
+    func getKnowledgeById(_ id: String) async throws -> [String: Any] {
+        return try await network.requestJSON(path: "/api/v1/knowledge/\(id)")
+    }
+
+    func updateKnowledge(id: String, payload: [String: Any]) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/knowledge/\(id)/update",
+            method: .post,
+            body: payload
+        )
+    }
+
+    /// Updates knowledge base access grants. Pass an empty array to make it private (owner-only).
+    @discardableResult
+    func updateKnowledgeAccessGrants(id: String, grants: [[String: Any]]) async throws -> [String: Any] {
+        let body: [String: Any] = ["access_grants": grants]
+        return try await network.requestJSON(
+            path: "/api/v1/knowledge/\(id)/access/update",
+            method: .post,
+            body: body
+        )
+    }
+
+    func deleteKnowledge(id: String) async throws {
+        try await network.requestVoid(
+            path: "/api/v1/knowledge/\(id)/delete",
+            method: .delete
+        )
+    }
+
+    func resetKnowledge(id: String) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/knowledge/\(id)/reset",
+            method: .post,
+            body: [:]
+        )
+    }
+
+    /// Fetches all paginated files for a knowledge base.
+    /// Iterates pages until an empty items array is returned.
+    /// Server returns {"items": [...], "total": N} per page.
+    func getKnowledgeFilesForKB(_ id: String) async throws -> [[String: Any]] {
+        var allItems: [[String: Any]] = []
+        var page = 1
+        while true {
+            let (data, _) = try await network.requestRaw(
+                path: "/api/v1/knowledge/\(id)/files",
+                queryItems: [URLQueryItem(name: "page", value: "\(page)")]
+            )
+            let json = try JSONSerialization.jsonObject(with: data)
+            if let dict = json as? [String: Any], let items = dict["items"] as? [[String: Any]] {
+                if items.isEmpty { break }
+                allItems.append(contentsOf: items)
+                page += 1
+            } else if let array = json as? [[String: Any]] {
+                // Flat array fallback (legacy) — no pagination possible
+                return array
+            } else {
+                break
+            }
+        }
+        return allItems
+    }
+
+    func addFileToKnowledge(knowledgeId: String, fileId: String) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/knowledge/\(knowledgeId)/file/add",
+            method: .post,
+            body: ["file_id": fileId]
+        )
+    }
+
+    func removeFileFromKnowledge(knowledgeId: String, fileId: String) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/knowledge/\(knowledgeId)/file/remove",
+            method: .post,
+            body: ["file_id": fileId]
+        )
+    }
+
+    func batchAddFilesToKnowledge(knowledgeId: String, fileIds: [String]) async throws -> [String: Any] {
+        // The server expects an array of KnowledgeFileIdForm objects: [{"file_id": "..."}, ...]
+        let bodyData = try JSONSerialization.data(withJSONObject: fileIds.map { ["file_id": $0] })
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/knowledge/\(knowledgeId)/files/batch/add",
+            method: .post,
+            body: bodyData
+        )
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Fetches the file count for a knowledge base using the paginated files endpoint.
+    /// Returns the `total` field which reflects files added from any client (app or web UI).
+    func getKnowledgeFileCount(_ id: String) async throws -> Int {
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/knowledge/\(id)/files",
+            queryItems: [URLQueryItem(name: "page", value: "1")]
+        )
+        let json = try JSONSerialization.jsonObject(with: data)
+        if let dict = json as? [String: Any] {
+            return dict["total"] as? Int ?? 0
+        }
+        return 0
+    }
+
+    // MARK: - Retrieval / Web Scraping
+
+    /// Scrapes a web page and returns its extracted text content.
+    ///
+    /// `POST /api/v1/retrieval/process/web?process=false`
+    ///
+    /// The `process=false` parameter returns the content directly without
+    /// storing it in the vector database — content is returned in the response.
+    ///
+    /// - Parameter url: The full URL of the web page to scrape.
+    /// - Returns: The extracted text content of the page.
+    func processWebPage(url: String) async throws -> String {
+        let body: [String: Any] = [
+            "url": url,
+            "collection_name": ""
+        ]
+        let json = try await network.requestJSON(
+            path: "/api/v1/retrieval/process/web",
+            method: .post,
+            queryItems: [URLQueryItem(name: "process", value: "false")],
+            body: body,
+            timeout: 60
+        )
+        guard let content = json["content"] as? String else {
+            throw APIError.responseDecoding(
+                underlying: NSError(
+                    domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Missing content in web scrape response"]
+                ),
+                data: nil
+            )
+        }
+        return content
+    }
+
+    // MARK: - Skills
+
+    /// GET /api/v1/skills/list?page=1 — returns paginated {items, total}
+    func getSkills() async throws -> [SkillItem] {
+        let json = try await network.requestJSON(
+            path: "/api/v1/skills/list",
+            queryItems: [URLQueryItem(name: "page", value: "1")]
+        )
+        let items = json["items"] as? [[String: Any]] ?? []
+        return items.compactMap { SkillItem(json: $0) }
+    }
+
+    /// GET /api/v1/skills/id/{id} — returns full skill including content field
+    func getSkillDetail(id: String) async throws -> SkillDetail {
+        let json = try await network.requestJSON(path: "/api/v1/skills/id/\(id)")
+        guard let detail = SkillDetail(json: json) else {
+            throw APIError.responseDecoding(
+                underlying: NSError(domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to parse SkillDetail"]),
+                data: Data()
+            )
+        }
+        return detail
+    }
+
+    /// POST /api/v1/skills/create
+    func createSkill(detail: SkillDetail) async throws -> SkillDetail {
+        let json = try await network.requestJSON(
+            path: "/api/v1/skills/create",
+            method: .post,
+            body: detail.toCreatePayload()
+        )
+        guard let created = SkillDetail(json: json) else {
+            throw APIError.responseDecoding(
+                underlying: NSError(domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to parse created SkillDetail"]),
+                data: Data()
+            )
+        }
+        return created
+    }
+
+    /// POST /api/v1/skills/id/{id}/update
+    func updateSkill(detail: SkillDetail) async throws -> SkillDetail {
+        let json = try await network.requestJSON(
+            path: "/api/v1/skills/id/\(detail.id)/update",
+            method: .post,
+            body: detail.toUpdatePayload()
+        )
+        guard let updated = SkillDetail(json: json) else {
+            throw APIError.responseDecoding(
+                underlying: NSError(domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to parse updated SkillDetail"]),
+                data: Data()
+            )
+        }
+        return updated
+    }
+
+    /// POST /api/v1/skills/id/{id}/toggle
+    func toggleSkill(id: String) async throws -> SkillDetail {
+        let json = try await network.requestJSON(
+            path: "/api/v1/skills/id/\(id)/toggle",
+            method: .post,
+            body: [:]
+        )
+        guard let detail = SkillDetail(json: json) else {
+            throw APIError.responseDecoding(
+                underlying: NSError(domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to parse toggled SkillDetail"]),
+                data: Data()
+            )
+        }
+        return detail
+    }
+
+    /// DELETE /api/v1/skills/id/{id}/delete
+    func deleteSkill(id: String) async throws {
+        try await network.requestVoid(
+            path: "/api/v1/skills/id/\(id)/delete",
+            method: .delete
+        )
+    }
+
+    /// POST /api/v1/skills/id/{id}/access/update
+    @discardableResult
+    func updateSkillAccessGrants(id: String, grants: [[String: Any]]) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/skills/id/\(id)/access/update",
+            method: .post,
+            body: ["access_grants": grants]
+        )
+    }
+
+    /// GET /api/v1/skills/export — returns full array of all skill objects
+    func exportSkills() async throws -> [SkillDetail] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/skills/export")
+        guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return array.compactMap { SkillDetail(json: $0) }
+    }
+
+    // MARK: - Workspace Models
+
+    /// GET /api/v1/models/list — workspace models (user-created only, not base models)
+    func listWorkspaceModels() async throws -> [ModelItem] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/models/list")
+        let json = try JSONSerialization.jsonObject(with: data)
+        let array: [[String: Any]]
+        if let dict = json as? [String: Any], let items = dict["items"] as? [[String: Any]] {
+            array = items
+        } else if let arr = json as? [[String: Any]] {
+            array = arr
+        } else { return [] }
+        return array.compactMap { ModelItem(json: $0) }
+    }
+
+    /// GET /api/v1/models/model?id={id} — full model detail (typed wrapper)
+    func getWorkspaceModelDetail(id: String) async throws -> ModelDetail {
+        let json = try await network.requestJSON(
+            path: "/api/v1/models/model",
+            queryItems: [URLQueryItem(name: "id", value: id)]
+        )
+        guard let detail = ModelDetail(json: json) else {
+            throw APIError.responseDecoding(
+                underlying: NSError(domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to parse ModelDetail"]),
+                data: Data()
+            )
+        }
+        return detail
+    }
+
+    /// POST /api/v1/models/create
+    func createWorkspaceModel(payload: [String: Any]) async throws -> [String: Any] {
+        try await network.requestJSON(path: "/api/v1/models/create", method: .post, body: payload)
+    }
+
+    /// POST /api/v1/models/model/update
+    func updateWorkspaceModel(payload: [String: Any]) async throws -> [String: Any] {
+        try await network.requestJSON(path: "/api/v1/models/model/update", method: .post, body: payload)
+    }
+
+    /// POST /api/v1/models/model/delete  body: {"id": id}
+    func deleteWorkspaceModel(id: String) async throws {
+        try await network.requestVoidJSON(
+            path: "/api/v1/models/model/delete",
+            method: .post,
+            body: ["id": id]
+        )
+    }
+
+    /// POST /api/v1/models/model/toggle?id={id}
+    func toggleWorkspaceModel(id: String) async throws -> [String: Any] {
+        try await network.requestJSON(
+            path: "/api/v1/models/model/toggle",
+            method: .post,
+            queryItems: [URLQueryItem(name: "id", value: id)],
+            body: [:]
+        )
+    }
+
+    /// POST /api/v1/models/model/access/update  body: ModelAccessGrantsForm
+    @discardableResult
+    func updateModelAccessGrants(id: String, name: String?, grants: [[String: Any]]) async throws -> [String: Any] {
+        var body: [String: Any] = ["id": id, "access_grants": grants]
+        if let name { body["name"] = name }
+        return try await network.requestJSON(
+            path: "/api/v1/models/model/access/update",
+            method: .post,
+            body: body
+        )
+    }
+
+    /// GET /api/v1/models/export — returns array of model JSON objects
+    func exportWorkspaceModels() async throws -> [[String: Any]] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/models/export")
+        guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return array
+    }
+
+    /// POST /api/v1/models/import  body: {"models": [...]}
+    func importWorkspaceModels(models: [[String: Any]]) async throws {
+        try await network.requestVoidJSON(
+            path: "/api/v1/models/import",
+            method: .post,
+            body: ["models": models]
+        )
+    }
+
     // MARK: - Tools
 
+    /// GET /api/v1/tools/ — returns list of all tools
+    func getToolItems() async throws -> [WorkspaceToolItem] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/tools/list")
+        guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return array.compactMap { WorkspaceToolItem(json: $0) }
+    }
+
+    /// GET /api/v1/tools/id/{id} — returns full tool detail including content
+    func getToolDetail(id: String) async throws -> ToolDetail {
+        let json = try await network.requestJSON(path: "/api/v1/tools/id/\(id)")
+        guard let detail = ToolDetail(json: json) else {
+            throw APIError.responseDecoding(
+                underlying: NSError(domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to parse ToolDetail"]),
+                data: Data()
+            )
+        }
+        return detail
+    }
+
+    /// POST /api/v1/tools/create
+    func createTool(detail: ToolDetail) async throws -> ToolDetail {
+        let json = try await network.requestJSON(
+            path: "/api/v1/tools/create",
+            method: .post,
+            body: detail.toCreatePayload()
+        )
+        guard let created = ToolDetail(json: json) else {
+            throw APIError.responseDecoding(
+                underlying: NSError(domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to parse created ToolDetail"]),
+                data: Data()
+            )
+        }
+        return created
+    }
+
+    /// POST /api/v1/tools/id/{id}/update
+    func updateTool(detail: ToolDetail) async throws -> ToolDetail {
+        let json = try await network.requestJSON(
+            path: "/api/v1/tools/id/\(detail.id)/update",
+            method: .post,
+            body: detail.toUpdatePayload()
+        )
+        guard let updated = ToolDetail(json: json) else {
+            throw APIError.responseDecoding(
+                underlying: NSError(domain: "APIError", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to parse updated ToolDetail"]),
+                data: Data()
+            )
+        }
+        return updated
+    }
+
+    /// DELETE /api/v1/tools/id/{id}/delete
+    func deleteTool(id: String) async throws {
+        try await network.requestVoid(
+            path: "/api/v1/tools/id/\(id)/delete",
+            method: .delete
+        )
+    }
+
+    /// POST /api/v1/tools/id/{id}/access/update
+    @discardableResult
+    func updateToolAccessGrants(id: String, grants: [[String: Any]]) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/tools/id/\(id)/access/update",
+            method: .post,
+            body: ["access_grants": grants]
+        )
+    }
+
+    /// GET /api/v1/tools/export — returns full array of all tool objects
+    func exportTools() async throws -> [ToolDetail] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/tools/export")
+        guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return array.compactMap { ToolDetail(json: $0) }
+    }
+
+    /// GET /api/v1/tools/id/{id}/valves — returns current valve values as dict.
+    /// Returns empty dict if no user valves have been saved yet (server returns empty body).
+    func getToolValves(id: String) async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/tools/id/\(id)/valves")
+        guard !data.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        return json
+    }
+
+    /// GET /api/v1/tools/id/{id}/valves/spec — returns JSON schema for valves.
+    /// Returns empty dict if the tool has no valves (server returns empty body).
+    func getToolValvesSpec(id: String) async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/tools/id/\(id)/valves/spec")
+        guard !data.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        return json
+    }
+
+    /// GET /api/v1/tools/id/{id}/valves/spec — same as above, but also returns the
+    /// property keys in their original JSON insertion order so the UI can match the
+    /// ordering shown in OpenWebUI.
+    ///
+    /// `JSONSerialization` returns an unordered `[String: Any]` dictionary, so we
+    /// parse the raw bytes a second time with a lightweight scanner to extract the
+    /// key order from the `"properties"` object.
+    func getToolValvesSpecOrdered(id: String) async throws -> ([String: Any], [String]) {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/tools/id/\(id)/valves/spec")
+        guard !data.isEmpty else { return ([:], []) }
+        let spec = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        let keyOrder = extractPropertyKeyOrder(from: data)
+        return (spec, keyOrder)
+    }
+
+    /// Scans raw JSON bytes to extract the insertion-ordered keys of the top-level
+    /// `"properties"` object.  This is necessary because `JSONSerialization` returns
+    /// an unordered Swift dictionary, losing the server's original ordering.
+    ///
+    /// The scanner works character-by-character at depth 0 inside the `properties`
+    /// brace block, collecting only the top-level key strings.
+    private func extractPropertyKeyOrder(from data: Data) -> [String] {
+        guard let json = String(data: data, encoding: .utf8) else { return [] }
+
+        // Find `"properties"` key and then the opening brace of its value
+        guard let propsKeyRange = json.range(of: "\"properties\"") else { return [] }
+        let afterPropsKey = json[propsKeyRange.upperBound...]
+
+        guard let braceStart = afterPropsKey.firstIndex(of: "{") else { return [] }
+
+        var keys: [String] = []
+        var depth = 0        // nesting depth inside the properties object
+        var idx = afterPropsKey.index(after: braceStart)
+        var inString = false
+        var escaped = false
+
+        while idx < afterPropsKey.endIndex {
+            let ch = afterPropsKey[idx]
+
+            if escaped {
+                escaped = false
+                idx = afterPropsKey.index(after: idx)
+                continue
+            }
+
+            if ch == "\\" && inString {
+                escaped = true
+                idx = afterPropsKey.index(after: idx)
+                continue
+            }
+
+            if ch == "\"" {
+                if inString {
+                    inString = false
+                } else if depth == 0 {
+                    // A quoted string at depth==0 is a top-level property key
+                    let keyStart = afterPropsKey.index(after: idx)
+                    var ki = keyStart
+                    var keyChars: [Character] = []
+                    var innerEscaped = false
+                    while ki < afterPropsKey.endIndex {
+                        let kc = afterPropsKey[ki]
+                        if innerEscaped {
+                            keyChars.append(kc)
+                            innerEscaped = false
+                        } else if kc == "\\" {
+                            innerEscaped = true
+                        } else if kc == "\"" {
+                            break
+                        } else {
+                            keyChars.append(kc)
+                        }
+                        ki = afterPropsKey.index(after: ki)
+                    }
+                    let key = String(keyChars)
+                    if !key.isEmpty { keys.append(key) }
+                    // Advance idx past the closing quote of the key
+                    idx = ki
+                } else {
+                    inString = true
+                }
+            } else if !inString {
+                if ch == "{" { depth += 1 }
+                else if ch == "}" {
+                    if depth == 0 { break }  // end of properties object
+                    depth -= 1
+                }
+            }
+
+            idx = afterPropsKey.index(after: idx)
+        }
+
+        return keys
+    }
+
+    /// POST /api/v1/tools/id/{id}/valves/update
+    /// Sends null for keys the user wants to reset to default (removes their override).
+    /// The server may return {} or an empty body — both are handled gracefully.
+    @discardableResult
+    func updateToolValves(id: String, values: [String: Any]) async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/tools/id/\(id)/valves/update",
+            method: .post,
+            body: try JSONSerialization.data(withJSONObject: values)
+        )
+        guard !data.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        return json
+    }
+
+    /// POST /api/v1/tools/load/url — import a tool from a remote URL
+    func loadToolFromURL(url: String) async throws -> [String: Any] {
+        return try await network.requestJSON(
+            path: "/api/v1/tools/load/url",
+            method: .post,
+            body: ["url": url]
+        )
+    }
+
+    // Legacy shim — kept for any callers using the old name
     func getTools() async throws -> [[String: Any]] {
-        let (data, _) = try await network.requestRaw(path: "/api/v1/tools/")
+        let (data, _) = try await network.requestRaw(path: "/api/v1/tools/list")
         guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             return []
         }
@@ -1643,6 +2411,27 @@ final class APIClient: @unchecked Sendable {
         return []
     }
 
+    /// Fetches the server's audio configuration (engine, model, voice settings).
+    /// `GET /api/v1/audio/config`
+    func getAudioConfig() async throws -> [String: Any] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/audio/config")
+        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Fetches available TTS models from the server.
+    /// `GET /api/v1/audio/models`
+    func getAudioModels() async throws -> [[String: Any]] {
+        let (data, _) = try await network.requestRaw(path: "/api/v1/audio/models")
+        if let dict = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let models = dict["models"] as? [[String: Any]] {
+            return models
+        }
+        if let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            return array
+        }
+        return []
+    }
+
     // MARK: - Chat Extended Operations
 
     func unshareConversation(id: String) async throws {
@@ -1680,6 +2469,20 @@ final class APIClient: @unchecked Sendable {
             path: "/api/v1/chats/unarchive/all",
             method: .post
         )
+    }
+
+    /// Fetches a page of shared chats from `GET /api/v1/chats/shared`.
+    /// Returns an empty array when the page is beyond the last page.
+    func getSharedChats(page: Int = 1) async throws -> [Conversation] {
+        let queryItems = [URLQueryItem(name: "page", value: "\(page)")]
+        let (data, _) = try await network.requestRaw(
+            path: "/api/v1/chats/shared",
+            queryItems: queryItems
+        )
+        guard let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return array.compactMap { parseConversationSummary($0) }
     }
 
     // MARK: - Memories
@@ -1911,7 +2714,7 @@ final class APIClient: @unchecked Sendable {
     // MARK: - Private Helpers
 
     private func parseModelArray(_ models: [[String: Any]]) -> [AIModel] {
-        models.compactMap { raw -> AIModel? in
+        return models.compactMap { raw -> AIModel? in
             guard let id = raw["id"] as? String else { return nil }
             let name = raw["name"] as? String ?? id
 
@@ -1972,6 +2775,17 @@ final class APIClient: @unchecked Sendable {
 
             let connectionType = raw["connection_type"] as? String
 
+            // Detect pipe/function models — server sets raw["pipe"] = {"type": "pipe"}
+            // for models backed by a Python pipe function.
+            let isPipeModel = raw["pipe"] != nil
+
+            // Extract filter IDs — server sends raw["filters"] = [{"id": "...", ...}]
+            // These are sent as filter_ids in chat completion requests.
+            let filterIds: [String] = {
+                guard let filters = raw["filters"] as? [[String: Any]] else { return [] }
+                return filters.compactMap { $0["id"] as? String }
+            }()
+
             return AIModel(
                 id: id,
                 name: name,
@@ -1987,7 +2801,10 @@ final class APIClient: @unchecked Sendable {
                 functionCallingMode: functionCallingMode,
                 builtinTools: builtinTools,
                 tags: tags,
-                connectionType: connectionType
+                connectionType: connectionType,
+                isPipeModel: isPipeModel,
+                filterIds: filterIds,
+                rawModelItem: raw
             )
         }
     }
@@ -2258,6 +3075,17 @@ final class APIClient: @unchecked Sendable {
 
         let followUps = msg["followUps"] as? [String] ?? msg["follow_ups"] as? [String] ?? []
 
+        // Parse message-level embeds — OpenWebUI stores Rich UI HTML here when the
+        // tool call's <details> block has an empty embeds="" attribute.
+        // Each entry is a full HTML string (audio player, image card, etc.).
+        let embeds: [String] = {
+            // The server sends embeds as [String] — filter out empty strings
+            if let arr = msg["embeds"] as? [String] {
+                return arr.filter { !$0.isEmpty }
+            }
+            return []
+        }()
+
         var files: [ChatMessageFile] = []
         if let rawFiles = msg["files"] as? [[String: Any]] {
             for file in rawFiles {
@@ -2272,6 +3100,13 @@ final class APIClient: @unchecked Sendable {
             }
         }
 
+        // Parse usage data if present — stored by the server after generation completes.
+        // This allows messages sent from the web UI to show the ⓘ usage button on load.
+        var usage: [String: Any]?
+        if let rawUsage = msg["usage"] as? [String: Any], !rawUsage.isEmpty {
+            usage = rawUsage
+        }
+
         return ChatMessage(
             id: id,
             role: role,
@@ -2282,7 +3117,9 @@ final class APIClient: @unchecked Sendable {
             files: files,
             sources: sources,
             followUps: followUps,
-            error: error
+            error: error,
+            usage: usage,
+            embeds: embeds
         )
     }
 
@@ -2380,6 +3217,13 @@ final class APIClient: @unchecked Sendable {
                 } else {
                     msgDict["error"] = ["content": ""]
                 }
+            }
+
+            // Preserve usage data so the server retains token stats for all messages.
+            // Without this, every sync wipes usage from earlier messages, causing
+            // the ⓘ icon to disappear after navigation and corrupting the web UI too.
+            if let usage = msg.usage, !usage.isEmpty {
+                msgDict["usage"] = usage
             }
 
             messagesMap[msg.id] = msgDict

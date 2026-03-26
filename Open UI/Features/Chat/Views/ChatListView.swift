@@ -24,219 +24,75 @@ struct ChatListView: View {
     // Tracks whether the "Chats" header drop zone is highlighted
     @State private var chatsDropTargetActive: Bool = false
 
+    private var isEmpty: Bool {
+        viewModel.conversations.isEmpty && viewModel.folderViewModel.folders.isEmpty
+    }
+
+    private var navigationTitle: String {
+        viewModel.isSelectionMode
+            ? String(localized: "\(viewModel.selectedCount) Selected")
+            : String(localized: "Chats")
+    }
+
+    @ViewBuilder
+    private var listContent: some View {
+        if viewModel.isLoading && viewModel.conversations.isEmpty {
+            loadingView
+        } else if isEmpty && viewModel.errorMessage == nil {
+            emptyStateView
+        } else if let error = viewModel.errorMessage, viewModel.conversations.isEmpty {
+            errorView(error)
+        } else {
+            conversationList
+        }
+    }
+
     var body: some View {
         @Bindable var router = router
-        let folderVM = viewModel.folderViewModel
-        let isEmpty = viewModel.conversations.isEmpty && folderVM.folders.isEmpty
-
         NavigationStack(path: $router.path) {
-            Group {
-                if viewModel.isLoading && viewModel.conversations.isEmpty {
-                    loadingView
-                } else if isEmpty && viewModel.errorMessage == nil {
-                    emptyStateView
-                } else if let error = viewModel.errorMessage, viewModel.conversations.isEmpty {
-                    errorView(error)
-                } else {
-                    conversationList
-                }
-            }
-            .navigationTitle(viewModel.isSelectionMode
-                ? String(localized: "\(viewModel.selectedCount) Selected")
-                : String(localized: "Chats")
-            )
-            .searchable(
-                text: $viewModel.searchText,
-                prompt: String(localized: "Search conversations")
-            )
+            navigationContent(router: router)
+        }
+    }
+
+    private func navigationContent(router: AppRouter) -> some View {
+        listContent
+            .navigationTitle(navigationTitle)
+            .searchable(text: $viewModel.searchText, prompt: String(localized: "Search conversations"))
             .onChange(of: viewModel.searchText) { _, newValue in
-                if newValue.count >= 2 {
-                    viewModel.triggerSearch()
-                }
+                if newValue.count >= 2 { viewModel.triggerSearch() }
             }
             .toolbar { toolbarContent }
             .navigationDestination(for: Route.self) { route in
-                switch route {
-                case .chatDetail(let conversationId):
-                    ChatDetailView(
-                        conversationId: conversationId,
-                        viewModel: dependencies.activeChatStore.viewModel(for: conversationId)
-                    )
-                case .newChat:
-                    ChatDetailView(
-                        viewModel: dependencies.activeChatStore.viewModel(for: nil)
-                    )
-                case .notesList:
-                    NotesListView()
-                case .noteEditor(let noteId):
-                    NoteEditorView(noteId: noteId)
-                default:
-                    EmptyView()
-                }
+                routeDestination(route)
             }
-            .sheet(item: $router.presentedSheet) { route in
-                switch route {
-                case .settings:
-                    SettingsView(
-                        viewModel: dependencies.authViewModel,
-                        appearanceManager: dependencies.appearanceManager
-                    )
-                case .voiceCall(let startNew):
-                    VoiceCallView(
-                        viewModel: dependencies.makeVoiceCallViewModel(),
-                        startNewConversation: startNew
-                    )
-                default:
-                    EmptyView()
-                }
-            }
-            // Create folder sheet
-            .sheet(isPresented: $showCreateFolderSheet) {
-                createFolderSheet
-            }
-            // Rename folder sheet
-            .sheet(item: $folderToRename) { folder in
-                CreateFolderSheet(existingName: folder.name, onRename: { newName in
-                    viewModel.folderViewModel.renameText = newName
-                    Task { await viewModel.folderViewModel.commitRename() }
-                })
-            }
-            // Share chat sheet
-            .sheet(item: $sharingConversation) { conversation in
-                if let apiClient = dependencies.apiClient {
-                    ShareChatSheet(
-                        conversation: conversation,
-                        apiClient: apiClient,
-                        serverBaseURL: apiClient.baseURL,
-                        onShareIdUpdated: { shareId in
-                            viewModel.updateShareId(for: conversation.id, shareId: shareId)
-                        },
-                        onClone: { cloned in
-                            router.navigate(to: .chatDetail(conversationId: cloned.id))
-                        }
-                    )
-                    .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
-                }
-            }
-            .refreshable {
-                await withTaskGroup(of: Void.self) { group in
-                    group.addTask { await viewModel.refreshConversations() }
-                    group.addTask { await folderVM.loadFolders() }
-                }
-            }
-            .task {
-                if let manager = dependencies.conversationManager {
-                    viewModel.configure(with: manager)
-                }
-                if let folderManager = dependencies.folderManager {
-                    folderVM.configure(with: folderManager)
-                }
+            .applySheets(
+                router: router,
+                showCreateFolderSheet: $showCreateFolderSheet,
+                folderToRename: $folderToRename,
+                sharingConversation: $sharingConversation,
+                viewModel: viewModel,
+                dependencies: dependencies
+            )
+            .applyLifecycle(viewModel: viewModel, dependencies: dependencies)
+            .applyAlertsAndDialogs(viewModel: viewModel, theme: theme)
+    }
 
-                // Load conversations and folders in parallel
-                await withTaskGroup(of: Void.self) { group in
-                    group.addTask { await viewModel.loadConversations() }
-                    group.addTask { await folderVM.loadFolders() }
-                }
-
-                dependencies.updateWidgetData(conversations: viewModel.conversations)
-                ShortcutDonationService.donateContinueConversation()
-            }
-            // Rename conversation alert
-            .alert(
-                String(localized: "Rename Conversation"),
-                isPresented: .init(
-                    get: { viewModel.renamingConversation != nil },
-                    set: { if !$0 { viewModel.renamingConversation = nil } }
-                )
-            ) {
-                TextField(String(localized: "Title"), text: $viewModel.renameText)
-                Button(String(localized: "Cancel"), role: .cancel) {
-                    viewModel.renamingConversation = nil
-                }
-                Button(String(localized: "Save")) {
-                    Task { await viewModel.commitRename() }
-                }
-            } message: {
-                Text("Enter a new name for this conversation.")
-            }
-            // Rename folder alert (via FolderListViewModel)
-            .alert(
-                String(localized: "Rename Folder"),
-                isPresented: .init(
-                    get: { viewModel.folderViewModel.renamingFolder != nil },
-                    set: { if !$0 { viewModel.folderViewModel.renamingFolder = nil } }
-                )
-            ) {
-                TextField(
-                    String(localized: "Folder Name"),
-                    text: Bindable(viewModel.folderViewModel).renameText
-                )
-                Button(String(localized: "Cancel"), role: .cancel) {
-                    viewModel.folderViewModel.renamingFolder = nil
-                }
-                Button(String(localized: "Rename")) {
-                    Task { await viewModel.folderViewModel.commitRename() }
-                }
-            }
-            // Single delete confirmation
-            .destructiveConfirmation(
-                isPresented: .init(
-                    get: { viewModel.deletingConversation != nil },
-                    set: { if !$0 { viewModel.deletingConversation = nil } }
-                ),
-                title: String(localized: "Delete Conversation"),
-                message: String(localized: "This action cannot be undone."),
-                destructiveTitle: String(localized: "Delete")
-            ) {
-                if let conversation = viewModel.deletingConversation {
-                    Task { await viewModel.deleteConversation(id: conversation.id) }
-                }
-            }
-            // Delete all confirmation
-            .destructiveConfirmation(
-                isPresented: $viewModel.showDeleteAllConfirmation,
-                title: String(localized: "Delete All Chats"),
-                message: String(localized: "This will permanently delete all your conversations. This action cannot be undone."),
-                destructiveTitle: String(localized: "Delete All")
-            ) {
-                Task { await viewModel.deleteAllConversations() }
-            }
-            // Archive all confirmation
-            .destructiveConfirmation(
-                isPresented: $viewModel.showArchiveAllConfirmation,
-                title: String(localized: "Archive All Chats"),
-                message: String(localized: "This will archive all your conversations. You can unarchive them later from the web interface."),
-                destructiveTitle: String(localized: "Archive All")
-            ) {
-                Task { await viewModel.archiveAllConversations() }
-            }
-            // Delete selected confirmation
-            .destructiveConfirmation(
-                isPresented: $viewModel.showDeleteSelectedConfirmation,
-                title: String(localized: "Delete Selected Chats"),
-                message: String(localized: "This will permanently delete \(viewModel.selectedCount) selected conversation(s). This action cannot be undone."),
-                destructiveTitle: String(localized: "Delete")
-            ) {
-                Task { await viewModel.deleteSelectedConversations() }
-            }
-            // Bulk delete progress overlay
-            .overlay {
-                if viewModel.isDeletingBulk {
-                    ZStack {
-                        Color.black.opacity(0.3).ignoresSafeArea()
-                        VStack(spacing: Spacing.md) {
-                            ProgressView().controlSize(.large)
-                            Text("Deleting…")
-                                .scaledFont(size: 16)
-                                .foregroundStyle(theme.textPrimary)
-                        }
-                        .padding(Spacing.xl)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
-                    }
-                    .transition(.opacity)
-                    .animation(.easeInOut(duration: AnimDuration.fast), value: viewModel.isDeletingBulk)
-                }
-            }
+    @ViewBuilder
+    private func routeDestination(_ route: Route) -> some View {
+        switch route {
+        case .chatDetail(let conversationId):
+            ChatDetailView(
+                conversationId: conversationId,
+                viewModel: dependencies.activeChatStore.viewModel(for: conversationId)
+            )
+        case .newChat:
+            ChatDetailView(viewModel: dependencies.activeChatStore.viewModel(for: nil))
+        case .notesList:
+            NotesListView()
+        case .noteEditor(let noteId):
+            NoteEditorView(noteId: noteId)
+        default:
+            EmptyView()
         }
     }
 
@@ -663,6 +519,173 @@ struct ChatListView: View {
                 .accessibilityHint(Text("Double tap to open. Long press for options. Drag to move to a folder."))
             }
         }
+    }
+}
+
+// MARK: - View Modifier Extensions (ChatListView)
+
+private extension View {
+    func applySheets(
+        router: AppRouter,
+        showCreateFolderSheet: Binding<Bool>,
+        folderToRename: Binding<ChatFolder?>,
+        sharingConversation: Binding<Conversation?>,
+        viewModel: ChatListViewModel,
+        dependencies: AppDependencyContainer
+    ) -> some View {
+        self
+            .sheet(item: Binding(get: { router.presentedSheet }, set: { router.presentedSheet = $0 })) { route in
+                switch route {
+                case .settings:
+                    SettingsView(
+                        viewModel: dependencies.authViewModel,
+                        appearanceManager: dependencies.appearanceManager
+                    )
+                case .voiceCall(let startNew):
+                    VoiceCallView(
+                        viewModel: dependencies.makeVoiceCallViewModel(),
+                        startNewConversation: startNew
+                    )
+                default:
+                    EmptyView()
+                }
+            }
+            .sheet(isPresented: showCreateFolderSheet) {
+                CreateFolderSheet(apiClient: dependencies.apiClient) { name, data, meta in
+                    Task { await viewModel.folderViewModel.createFolder(name: name, parentId: nil, data: data, meta: meta) }
+                }
+            }
+            .sheet(item: folderToRename) { folder in
+                CreateFolderSheet(existingName: folder.name, onRename: { newName in
+                    viewModel.folderViewModel.renameText = newName
+                    Task { await viewModel.folderViewModel.commitRename() }
+                })
+            }
+            .sheet(item: sharingConversation) { conversation in
+                if let apiClient = dependencies.apiClient {
+                    ShareChatSheet(
+                        conversation: conversation,
+                        apiClient: apiClient,
+                        serverBaseURL: apiClient.baseURL,
+                        onShareIdUpdated: { shareId in
+                            viewModel.updateShareId(for: conversation.id, shareId: shareId)
+                        },
+                        onClone: { cloned in
+                            router.navigate(to: .chatDetail(conversationId: cloned.id))
+                        }
+                    )
+                    .themed(with: dependencies.appearanceManager, accessibility: dependencies.accessibilityManager)
+                }
+            }
+    }
+
+    func applyLifecycle(
+        viewModel: ChatListViewModel,
+        dependencies: AppDependencyContainer
+    ) -> some View {
+        self
+            .refreshable {
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { await viewModel.refreshConversations() }
+                    group.addTask { await viewModel.folderViewModel.loadFolders() }
+                }
+            }
+            .task {
+                if let manager = dependencies.conversationManager {
+                    viewModel.configure(with: manager)
+                }
+                if let folderManager = dependencies.folderManager {
+                    viewModel.folderViewModel.configure(with: folderManager)
+                }
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { await viewModel.loadConversations() }
+                    group.addTask { await viewModel.folderViewModel.loadFolders() }
+                }
+                dependencies.updateWidgetData(conversations: viewModel.conversations)
+            }
+    }
+
+    func applyAlertsAndDialogs(
+        viewModel: ChatListViewModel,
+        theme: AppTheme
+    ) -> some View {
+        self
+            .alert(String(localized: "Rename Conversation"),
+                isPresented: .init(
+                    get: { viewModel.renamingConversation != nil },
+                    set: { if !$0 { viewModel.renamingConversation = nil } }
+                )
+            ) {
+                TextField(String(localized: "Title"), text: Bindable(viewModel).renameText)
+                Button(String(localized: "Cancel"), role: .cancel) { viewModel.renamingConversation = nil }
+                Button(String(localized: "Save")) { Task { await viewModel.commitRename() } }
+            } message: {
+                Text("Enter a new name for this conversation.")
+            }
+            .alert(String(localized: "Rename Folder"),
+                isPresented: .init(
+                    get: { viewModel.folderViewModel.renamingFolder != nil },
+                    set: { if !$0 { viewModel.folderViewModel.renamingFolder = nil } }
+                )
+            ) {
+                TextField(String(localized: "Folder Name"), text: Bindable(viewModel.folderViewModel).renameText)
+                Button(String(localized: "Cancel"), role: .cancel) { viewModel.folderViewModel.renamingFolder = nil }
+                Button(String(localized: "Rename")) { Task { await viewModel.folderViewModel.commitRename() } }
+            }
+            .destructiveConfirmation(
+                isPresented: .init(
+                    get: { viewModel.deletingConversation != nil },
+                    set: { if !$0 { viewModel.deletingConversation = nil } }
+                ),
+                title: String(localized: "Delete Conversation"),
+                message: String(localized: "This action cannot be undone."),
+                destructiveTitle: String(localized: "Delete")
+            ) {
+                if let conversation = viewModel.deletingConversation {
+                    Task { await viewModel.deleteConversation(id: conversation.id) }
+                }
+            }
+            .destructiveConfirmation(
+                isPresented: Bindable(viewModel).showDeleteAllConfirmation,
+                title: String(localized: "Delete All Chats"),
+                message: String(localized: "This will permanently delete all your conversations. This action cannot be undone."),
+                destructiveTitle: String(localized: "Delete All")
+            ) {
+                Task { await viewModel.deleteAllConversations() }
+            }
+            .destructiveConfirmation(
+                isPresented: Bindable(viewModel).showArchiveAllConfirmation,
+                title: String(localized: "Archive All Chats"),
+                message: String(localized: "This will archive all your conversations. You can unarchive them later from the web interface."),
+                destructiveTitle: String(localized: "Archive All")
+            ) {
+                Task { await viewModel.archiveAllConversations() }
+            }
+            .destructiveConfirmation(
+                isPresented: Bindable(viewModel).showDeleteSelectedConfirmation,
+                title: String(localized: "Delete Selected Chats"),
+                message: String(localized: "This will permanently delete \(viewModel.selectedCount) selected conversation(s). This action cannot be undone."),
+                destructiveTitle: String(localized: "Delete")
+            ) {
+                Task { await viewModel.deleteSelectedConversations() }
+            }
+            .overlay {
+                if viewModel.isDeletingBulk {
+                    ZStack {
+                        Color.black.opacity(0.3).ignoresSafeArea()
+                        VStack(spacing: Spacing.md) {
+                            ProgressView().controlSize(.large)
+                            Text("Deleting…")
+                                .scaledFont(size: 16)
+                                .foregroundStyle(theme.textPrimary)
+                        }
+                        .padding(Spacing.xl)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    }
+                    .transition(.opacity)
+                    .animation(.easeInOut(duration: AnimDuration.fast), value: viewModel.isDeletingBulk)
+                }
+            }
     }
 }
 

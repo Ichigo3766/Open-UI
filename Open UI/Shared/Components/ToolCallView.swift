@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 // MARK: - Tool Call Data
 
@@ -10,6 +11,9 @@ struct ToolCallData: Identifiable {
     let arguments: String?
     let result: String?
     let isDone: Bool
+    /// Rich UI HTML embeds returned by the tool. Each string is a full HTML
+    /// document to be rendered inline in the chat as an interactive webview.
+    let embeds: [String]
 
     /// A display-friendly name (replaces underscores with spaces).
     var displayName: String {
@@ -223,14 +227,50 @@ enum ToolCallParser {
         let isDone = doneStr == "true"
         let arguments = extractAttribute("arguments", from: block)
         let result = extractAttribute("result", from: block)
+        let embeds = parseEmbedsAttribute(from: block)
 
         return ToolCallData(
             id: id,
             name: name,
             arguments: decodeHTMLEntities(arguments),
             result: decodeHTMLEntities(result),
-            isDone: isDone
+            isDone: isDone,
+            embeds: embeds
         )
+    }
+
+    /// Extracts and decodes the `embeds` attribute from a tool call block.
+    ///
+    /// The `embeds` attribute contains a JSON array of HTML strings, with HTML
+    /// entities encoded on top of valid JSON. The raw attribute value looks like:
+    ///   `[&quot;&lt;!DOCTYPE html&gt;\n&lt;html&gt;...&quot;]`
+    ///
+    /// Critical: we must ONLY decode HTML entities (&quot; &lt; &gt; &amp; &apos;)
+    /// and must NOT convert `\n` → actual newline or `\"` → `"` before parsing.
+    /// Those are JSON escape sequences that must remain intact so JSONSerialization
+    /// can parse the array correctly. Raw newlines inside JSON string values make
+    /// the JSON invalid and cause parse failure.
+    private static func parseEmbedsAttribute(from block: String) -> [String] {
+        guard let raw = extractAttribute("embeds", from: block),
+              !raw.isEmpty else { return [] }
+
+        // Decode ONLY HTML entities — do NOT touch \n or \" (those are JSON escapes)
+        let jsonStr = raw
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&apos;", with: "'")
+            .replacingOccurrences(of: "&#x27;", with: "'")
+            .replacingOccurrences(of: "&#39;", with: "'")
+
+        // Parse as a JSON array of strings
+        guard let data = jsonStr.data(using: .utf8),
+              let array = try? JSONSerialization.jsonObject(with: data) as? [String] else {
+            return []
+        }
+
+        return array.filter { !$0.isEmpty }
     }
 
     /// Extracts an HTML attribute value from a tag string.
@@ -357,14 +397,363 @@ enum ToolCallParser {
     }
 }
 
+// MARK: - Rich UI Embed View
+
+/// Renders a Rich UI embed — a full HTML document returned by a tool call —
+/// inside a sandboxed WKWebView. This brings Open WebUI's "Rich UI" feature
+/// to the iOS app: tools can return interactive HTML (cards, dashboards, charts,
+/// forms, SMS composers, etc.) that render inline in the chat.
+///
+/// ## Key behaviours
+/// - **Auto-sizing**: The embed HTML sends `parent.postMessage({ type: 'iframe:height', height })`.
+///   We inject a bridge script that converts this `postMessage` call into a native
+///   WKScriptMessage so we can resize the webview dynamically.
+/// - **URL scheme routing**: Any navigation (links, buttons, `window.open`) is
+///   intercepted and opened via `UIApplication.shared.open()` — so `sms:`, `tel:`,
+///   `mailto:`, `https:` all work natively on iOS.
+/// - **Tool args injection**: Per the Rich UI spec, `window.args` is set to the
+///   JSON-parsed tool arguments so the embed can access what was passed to the tool.
+/// - **Auth token injection**: The app's JWT token is injected into the WKWebView's
+///   localStorage so the embed's `authFetch()` helper can include it on API calls.
+/// - **Dark mode**: WKWebView inherits the system appearance, so the embed's
+///   `@media (prefers-color-scheme: dark)` CSS rules fire correctly.
+/// - **No wrapping**: The HTML is loaded as-is. We only inject a thin bridge
+///   script for `postMessage` → native message handler translation.
+struct RichUIEmbedView: View {
+    let html: String
+    /// The tool call arguments JSON string, injected as `window.args`.
+    let toolArgs: String?
+    /// The server's auth JWT token injected into the webview's localStorage.
+    /// Allows embeds that call `/api/` endpoints to authenticate correctly.
+    var authToken: String? = nil
+    /// The server base URL used as the WKWebView's baseURL so relative `/api/`
+    /// paths resolve correctly and localStorage is accessible (not null-origin).
+    var serverBaseURL: String? = nil
+
+    /// Starts at 1 so the webview renders at minimal size until the embed
+    /// reports its own height via postMessage or the didFinish fallback fires.
+    @State private var webViewHeight: CGFloat = 1
+    @Environment(\.colorScheme) private var colorScheme
+
+    /// Maximum height before the embed gets internal scroll.
+    /// Tall embeds (weather dashboards, etc.) can scroll within this frame.
+    private let maxHeight: CGFloat = 600
+
+    var body: some View {
+        RichUIWebView(
+            html: instrumentedHTML,
+            height: $webViewHeight,
+            authToken: authToken,
+            serverBaseURL: serverBaseURL
+        )
+        .frame(height: min(max(webViewHeight, 1), maxHeight))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        )
+        .animation(.easeOut(duration: 0.2), value: webViewHeight)
+    }
+
+    /// The HTML with our bridge script injected just before `</body>` (or appended).
+    /// The bridge:
+    ///   1. Overrides `parent.postMessage` so the embed's height-reporting script works.
+    ///   2. Injects `window.args` for tool argument access.
+    ///
+    /// Also injects a `<meta name="viewport">` tag so WKWebView renders at device
+    /// width (not the default 980px desktop viewport). Without this the embed content
+    /// appears tiny because a 420px card is only ~43% of the 980px default viewport.
+    private var instrumentedHTML: String {
+        let argsJSON: String
+        if let args = toolArgs, !args.isEmpty {
+            // Escape backticks and backslashes for safe inline JS string literal
+            let escaped = args
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "`", with: "\\`")
+            argsJSON = escaped
+        } else {
+            argsJSON = "null"
+        }
+
+        let viewportMeta = #"<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0">"#
+
+        // Inject viewport meta tag into <head> so WKWebView uses device width.
+        // Try <head> first, then <html>, then prepend to the whole document.
+        func injectViewport(_ source: String) -> String {
+            if let range = source.range(of: "<head>", options: .caseInsensitive) {
+                // After opening <head>
+                return source.replacingCharacters(in: range, with: "<head>\(viewportMeta)")
+            } else if let range = source.range(of: "<head/>", options: .caseInsensitive) {
+                // Self-closing <head/> → replace with a proper head
+                return source.replacingCharacters(in: range, with: "<head>\(viewportMeta)</head>")
+            } else if let range = source.range(of: "<html", options: .caseInsensitive),
+                      let closeRange = source.range(of: ">", range: range.upperBound..<source.endIndex) {
+                // After the closing > of the <html ...> opening tag
+                return source.replacingCharacters(in: closeRange, with: "><head>\(viewportMeta)</head>")
+            } else {
+                // No HTML structure — prepend the meta tag
+                return "\(viewportMeta)\n\(source)"
+            }
+        }
+
+        let htmlWithViewport = injectViewport(html)
+
+        let bridge = """
+        <script>
+        (function() {
+          // Inject tool args so embeds can access window.args
+          try {
+            window.args = JSON.parse(`\(argsJSON)`);
+          } catch(e) {
+            window.args = null;
+          }
+
+          // Bridge parent.postMessage to our native handler.
+          // The embed HTML calls parent.postMessage({ type: 'iframe:height', height: h }, '*')
+          // for auto-sizing. In a WKWebView there is no real parent frame, so we
+          // intercept this and forward it to our WKScriptMessageHandler.
+          var _nativePost = function(msg) {
+            try {
+              if (msg && msg.type === 'iframe:height' && typeof msg.height === 'number') {
+                window.webkit.messageHandlers.richUIBridge.postMessage({ type: 'height', value: msg.height });
+              } else if (msg && msg.type === 'open-url' && msg.url) {
+                window.webkit.messageHandlers.richUIBridge.postMessage({ type: 'openUrl', url: msg.url });
+              }
+            } catch(e) {}
+          };
+
+          // Override parent.postMessage
+          try {
+            Object.defineProperty(window, 'parent', {
+              get: function() {
+                return {
+                  postMessage: _nativePost
+                };
+              }
+            });
+          } catch(e) {
+            // Fallback: assign directly if defineProperty fails
+            window.parent = { postMessage: _nativePost };
+          }
+
+          // Also handle window.postMessage calls that some embeds use
+          var _origPost = window.postMessage.bind(window);
+          window.postMessage = function(msg, targetOrigin) {
+            _nativePost(msg);
+            try { _origPost(msg, targetOrigin || '*'); } catch(e) {}
+          };
+        })();
+        </script>
+        """
+
+        // Inject bridge before </body> if present, otherwise append.
+        // Use htmlWithViewport (not the original html) so both injections apply.
+        if let range = htmlWithViewport.range(of: "</body>", options: .caseInsensitive) {
+            return htmlWithViewport.replacingCharacters(in: range, with: bridge + "</body>")
+        }
+        return htmlWithViewport + bridge
+    }
+}
+
+// MARK: - Rich UI WKWebView Wrapper
+
+/// UIViewRepresentable wrapping a WKWebView for Rich UI embeds.
+/// Handles height reporting and URL scheme routing.
+private struct RichUIWebView: UIViewRepresentable {
+    let html: String
+    @Binding var height: CGFloat
+    /// Auth JWT token injected into localStorage so the embed's authFetch()
+    /// can authenticate `/api/` calls. Nil when no token is available.
+    var authToken: String? = nil
+    /// The server base URL used as the WKWebView baseURL so:
+    /// 1. Relative `/api/` paths resolve against the correct origin.
+    /// 2. `localStorage` is not null-origin (which blocks access).
+    var serverBaseURL: String? = nil
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(height: $height, authToken: authToken)
+    }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let controller = WKUserContentController()
+        controller.add(context.coordinator, name: "richUIBridge")
+
+        let config = WKWebViewConfiguration()
+        config.userContentController = controller
+
+        let prefs = WKWebpagePreferences()
+        prefs.allowsContentJavaScript = true
+        config.defaultWebpagePreferences = prefs
+
+        // Allow inline media playback (useful for media-rich embeds)
+        config.allowsInlineMediaPlayback = true
+
+        // iOS WKWebView normally requires a direct user gesture to start audio/video.
+        // Even though the user taps the embed's play button, the JS `.play()` call
+        // may not be considered a "direct" gesture by WebKit's heuristics (it goes
+        // through a synthetic mouse/click event inside the webview). Setting this to
+        // `[]` removes ALL media playback restrictions so audio/video play works
+        // exactly as it does in a browser — matching the web UI behaviour.
+        config.mediaTypesRequiringUserActionForPlayback = []
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.isOpaque = false
+        webView.backgroundColor = .clear
+        // Allow vertical scroll so tall embeds (weather cards, dashboards) are
+        // fully accessible. The SwiftUI .frame(height:) cap limits the webview
+        // height, and internal scroll lets the user see the rest of the content.
+        webView.scrollView.isScrollEnabled = true
+        webView.scrollView.bounces = false
+        webView.scrollView.showsVerticalScrollIndicator = true
+        webView.scrollView.showsHorizontalScrollIndicator = false
+        webView.navigationDelegate = context.coordinator
+        webView.allowsLinkPreview = false
+
+        // Disable long-press selection to keep chat UX clean
+        webView.allowsBackForwardNavigationGestures = false
+
+        context.coordinator.webView = webView
+        webView.loadHTMLString(html, baseURL: resolvedBaseURL)
+        return webView
+    }
+
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        // Only reload if the HTML actually changed (e.g. args updated)
+        if context.coordinator.loadedHTML != html {
+            context.coordinator.loadedHTML = html
+            // Update coordinator's auth token in case it changed
+            context.coordinator.authToken = authToken
+            webView.loadHTMLString(html, baseURL: resolvedBaseURL)
+        }
+    }
+
+    /// The base URL passed to WKWebView for origin-based security:
+    /// - Relative `/api/` paths resolve against this origin.
+    /// - `localStorage` is not blocked by a null-origin restriction.
+    /// Falls back to nil when no server URL is configured.
+    private var resolvedBaseURL: URL? {
+        guard let base = serverBaseURL, !base.isEmpty else { return nil }
+        return URL(string: base)
+    }
+
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+        @Binding var height: CGFloat
+        var loadedHTML: String?
+        weak var webView: WKWebView?
+        /// Auth token injected into localStorage after every page load.
+        var authToken: String?
+
+        init(height: Binding<CGFloat>, authToken: String?) {
+            _height = height
+            self.authToken = authToken
+        }
+
+        // MARK: WKScriptMessageHandler
+
+        func userContentController(
+            _ userContentController: WKUserContentController,
+            didReceive message: WKScriptMessage
+        ) {
+            guard message.name == "richUIBridge",
+                  let body = message.body as? [String: Any] else { return }
+
+            switch body["type"] as? String {
+            case "height":
+                // Accept both Double (JS number) and CGFloat
+                let h: CGFloat? = {
+                    if let v = body["value"] as? Double { return CGFloat(v) }
+                    if let v = body["value"] as? CGFloat { return v }
+                    return nil
+                }()
+                if let h, h > 1 {
+                    DispatchQueue.main.async { [weak self] in self?.height = h }
+                }
+            case "openUrl":
+                if let urlString = body["url"] as? String, let url = URL(string: urlString) {
+                    DispatchQueue.main.async { UIApplication.shared.open(url) }
+                }
+            default:
+                break
+            }
+        }
+
+        // MARK: WKNavigationDelegate
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            guard let url = navigationAction.request.url else {
+                decisionHandler(.allow)
+                return
+            }
+
+            // Allow the initial HTML load (about:blank or data: scheme)
+            if navigationAction.navigationType == .other {
+                decisionHandler(.allow)
+                return
+            }
+
+            // Route all link taps / window.open / form submits to the system
+            // This handles sms:, tel:, mailto:, https:, custom schemes, etc.
+            if UIApplication.shared.canOpenURL(url) {
+                UIApplication.shared.open(url)
+            }
+            decisionHandler(.cancel)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            // Inject the auth token into localStorage so the embed's authFetch()
+            // helper can include it on Bearer-authenticated `/api/` requests.
+            // We do this on every didFinish (not just the first) so that if the
+            // page reloads it still has the token.
+            if let token = authToken, !token.isEmpty {
+                // Escape single quotes in the token to prevent JS injection.
+                let safeToken = token.replacingOccurrences(of: "'", with: "\\'")
+                webView.evaluateJavaScript("localStorage.setItem('token', '\(safeToken)')") { _, err in
+                    if let err { print("[RichUIWebView] localStorage inject error: \(err)") }
+                }
+            }
+
+            // Fallback: measure actual content height after load.
+            // Only fires if the embed hasn't already reported its height via postMessage.
+            // Use body.scrollHeight (content size) not documentElement.scrollHeight (viewport size).
+            webView.evaluateJavaScript("document.body.scrollHeight") { [weak self] result, _ in
+                guard let self else { return }
+                let h: CGFloat? = {
+                    if let v = result as? Double { return CGFloat(v) }
+                    if let v = result as? CGFloat { return v }
+                    return nil
+                }()
+                guard let h, h > 1 else { return }
+                DispatchQueue.main.async {
+                    // Only use fallback if postMessage hasn't already set a real height
+                    if self.height <= 1 {
+                        self.height = h
+                    }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Tool Call View
 
-/// Displays a single tool call as a collapsible disclosure group,
-/// matching the Flutter app's presentation.
+/// Displays a single tool call as a collapsible disclosure group.
+/// When the tool returns Rich UI embeds, they are shown inline below
+/// the header — always visible, matching the Open WebUI web behaviour.
+/// The raw Arguments/Result are available in an expandable section for
+/// developers who want to inspect the underlying data.
 struct ToolCallView: View {
     let toolCall: ToolCallData
+    var authToken: String? = nil
+    var serverBaseURL: String? = nil
     @State private var isExpanded: Bool = false
     @Environment(\.theme) private var theme
+
+    /// Whether this tool call has rich HTML embeds to display.
+    private var hasEmbeds: Bool { !toolCall.embeds.isEmpty }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -401,8 +790,24 @@ struct ToolCallView: View {
             }
             .buttonStyle(.plain)
 
-            // Expanded content
-            if isExpanded {
+            // Rich UI embeds — shown inline, always visible when the tool is done.
+            // When embeds are present the raw Arguments/Result are hidden: the embed
+            // IS the result, rendered visually. This matches the web UI behaviour.
+            if hasEmbeds && toolCall.isDone {
+                VStack(alignment: .leading, spacing: Spacing.sm) {
+                    ForEach(Array(toolCall.embeds.enumerated()), id: \.offset) { _, embedHTML in
+                        RichUIEmbedView(
+                            html: embedHTML,
+                            toolArgs: toolCall.arguments,
+                            authToken: authToken,
+                            serverBaseURL: serverBaseURL
+                        )
+                    }
+                }
+                .padding(.top, Spacing.xs)
+                .padding(.bottom, Spacing.sm)
+            } else if isExpanded {
+                // Raw Arguments / Result — only shown when there is no embed
                 VStack(alignment: .leading, spacing: Spacing.sm) {
                     if let args = toolCall.arguments, !args.isEmpty {
                         VStack(alignment: .leading, spacing: Spacing.xxs) {
@@ -465,12 +870,18 @@ struct ToolCallView: View {
 /// Renders a list of tool calls extracted from message content.
 struct ToolCallsContainer: View {
     let toolCalls: [ToolCallData]
+    var authToken: String? = nil
+    var serverBaseURL: String? = nil
 
     var body: some View {
         if !toolCalls.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(toolCalls) { toolCall in
-                    ToolCallView(toolCall: toolCall)
+                    ToolCallView(
+                        toolCall: toolCall,
+                        authToken: authToken,
+                        serverBaseURL: serverBaseURL
+                    )
                     if toolCall.id != toolCalls.last?.id {
                         Divider()
                             .padding(.leading, 24)
@@ -584,9 +995,22 @@ struct ReasoningContainer: View {
 /// the web UI behavior where you can see which tool call was made at which
 /// point during the response — providing important context about *why* a
 /// tool was invoked and what came after.
+///
+/// ## Message-level embeds
+/// OpenWebUI may store Rich UI HTML in the message object's `embeds` array
+/// rather than inside the tool call `<details>` block (the `embeds=""` attribute
+/// is empty in those cases). When `messageEmbeds` is non-empty, the embeds are
+/// injected into the last tool call that has empty embeds — matching web UI
+/// behavior where the player appears inline with the tool call that produced it.
+/// If there are no tool calls, embeds are rendered as standalone blocks after
+/// the text content.
 struct AssistantMessageContent: View {
     let content: String
     let isStreaming: Bool
+    var messageEmbeds: [String] = []
+    /// Passed down to Rich UI embeds for auth token injection and base URL resolution.
+    var authToken: String? = nil
+    var serverBaseURL: String? = nil
 
     /// ## OPT 3: Reference-type parse cache (fixes 1-frame stale race)
     ///
@@ -628,6 +1052,42 @@ struct AssistantMessageContent: View {
             return result
         }()
 
+        // Inject message-level embeds into the appropriate group:
+        // Find the last toolCalls group whose last call has no embeds and
+        // attach the messageEmbeds there (matching web UI inline placement).
+        // If no suitable tool call group exists, the embeds are rendered as
+        // standalone blocks appended after all other content.
+        let groups: [SegmentGroup] = {
+            let base = Self.groupSegments(ordered.segments)
+            guard !messageEmbeds.isEmpty else { return base }
+
+            // Search from the end for the last toolCalls group
+            var mutableGroups = base
+            for i in stride(from: mutableGroups.count - 1, through: 0, by: -1) {
+                if case .toolCalls(var calls) = mutableGroups[i] {
+                    // Find the last call in this group that has no embeds
+                    for j in stride(from: calls.count - 1, through: 0, by: -1) {
+                        if calls[j].embeds.isEmpty {
+                            let tc = calls[j]
+                            calls[j] = ToolCallData(
+                                id: tc.id,
+                                name: tc.name,
+                                arguments: tc.arguments,
+                                result: tc.result,
+                                isDone: tc.isDone,
+                                embeds: messageEmbeds
+                            )
+                            mutableGroups[i] = .toolCalls(calls)
+                            return mutableGroups
+                        }
+                    }
+                }
+            }
+            // No tool call with empty embeds found — append a sentinel group
+            // so the embeds are still rendered (handled below as .standaloneEmbeds).
+            return mutableGroups + [.standaloneEmbeds(messageEmbeds)]
+        }()
+
         VStack(alignment: .leading, spacing: Spacing.xs) {
             if ordered.segments.isEmpty && isStreaming {
                 // Show typing indicator when streaming with no content yet
@@ -639,7 +1099,6 @@ struct AssistantMessageContent: View {
                 // Render each segment in the order it appears in the content.
                 // Adjacent tool calls are grouped together with dividers
                 // for a cleaner look, matching the web UI.
-                let groups = Self.groupSegments(ordered.segments)
                 let lastTextIndex = groups.lastIndex(where: {
                     if case .text = $0 { return true }
                     return false
@@ -656,10 +1115,29 @@ struct AssistantMessageContent: View {
                         )
 
                     case .toolCalls(let calls):
-                        ToolCallsContainer(toolCalls: calls)
+                        ToolCallsContainer(
+                            toolCalls: calls,
+                            authToken: authToken,
+                            serverBaseURL: serverBaseURL
+                        )
 
                     case .reasoningBlocks(let blocks):
                         ReasoningContainer(blocks: blocks)
+
+                    case .standaloneEmbeds(let embeds):
+                        // Standalone embeds: no tool call to attach to.
+                        // Render the Rich UI webviews directly.
+                        VStack(alignment: .leading, spacing: Spacing.sm) {
+                            ForEach(Array(embeds.enumerated()), id: \.offset) { _, embedHTML in
+                                RichUIEmbedView(
+                                    html: embedHTML,
+                                    toolArgs: nil,
+                                    authToken: authToken,
+                                    serverBaseURL: serverBaseURL
+                                )
+                            }
+                        }
+                        .padding(.top, Spacing.xs)
                     }
                 }
 
@@ -690,6 +1168,8 @@ struct AssistantMessageContent: View {
         case text(String)
         case toolCalls([ToolCallData])
         case reasoningBlocks([ReasoningData])
+        /// Message-level embeds with no associated tool call to attach to.
+        case standaloneEmbeds([String])
     }
 
     private static func groupSegments(_ segments: [ContentSegment]) -> [SegmentGroup] {

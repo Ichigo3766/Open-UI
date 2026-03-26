@@ -272,6 +272,7 @@ struct ChannelDetailView: View {
                                 showError("Failed to remove members: \(error.localizedDescription)")
                             }
                         },
+                        apiClient: dependencies.apiClient,
                         editingChannel: channel,
                         allUsers: viewModel.allServerUsers,
                         channelMembers: viewModel.members

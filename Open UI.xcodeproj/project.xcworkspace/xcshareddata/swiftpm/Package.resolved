@@ -1,5 +1,5 @@
 {
-  "originHash" : "42a26ca2d6609b6207cdeb91d2f41ace59e1a4f8f430381e65162aed51ffe7ad",
+  "originHash" : "fa6e9e0ca517080edab92e5ada31e4c2d86fb643a7102aab6eb3453556ac217d",
   "pins" : [
     {
       "identity" : "beautiful-mermaid-swift",
@@ -70,7 +70,7 @@
       "location" : "https://github.com/Blaizzy/mlx-audio-swift.git",
       "state" : {
         "branch" : "main",
-        "revision" : "db2635b92b9a265609603009678fe2f103e7ab2c"
+        "revision" : "9bf8fb413de6d18af1312b171fa1c71ccd1f628f"
       }
     },
     {
