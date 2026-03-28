@@ -111,6 +111,12 @@ enum ToolCallParser {
     /// position of each `<details>` block relative to surrounding text.
     /// This is the core parser that all other methods delegate to.
     static func parseOrdered(_ content: String) -> OrderedParseResult {
+        // Pre-process: convert raw <think>…</think> tags (sent by models
+        // like Qwen, DeepSeek, etc.) into <details type="reasoning"> blocks
+        // so the existing regex picks them up and renders them as
+        // collapsible ReasoningView instead of raw visible text.
+        let content = preprocessThinkTags(content)
+
         let pattern = #"<details\s+[^>]*>[\s\S]*?</details>"#
 
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
@@ -272,6 +278,189 @@ enum ToolCallParser {
         }
 
         return array.filter { !$0.isEmpty }
+    }
+
+    // MARK: - Raw Reasoning Tag Preprocessing
+
+    /// All tag pairs that OpenWebUI recognises by default for reasoning content.
+    /// Order matters: more specific / longer tags first to avoid partial matches.
+    private static let defaultReasoningTagPairs: [(open: String, close: String)] = [
+        ("<|begin_of_thought|>", "<|end_of_thought|>"),
+        ("<thinking>", "</thinking>"),
+        ("<reasoning>", "</reasoning>"),
+        ("<thought>", "</thought>"),
+        ("<reason>", "</reason>"),
+        ("<think>", "</think>"),
+    ]
+
+    /// Converts raw reasoning tags (from model output) and incomplete
+    /// `<details type="reasoning">` blocks (mid-stream) into well-formed
+    /// `<details type="reasoning">` blocks so the existing parser handles
+    /// them uniformly.
+    ///
+    /// ## What this handles
+    ///
+    /// **Raw model tags** — Models like Qwen, DeepSeek R1, and others emit
+    /// raw tags (`<think>`, `<thinking>`, `<reason>`, `<reasoning>`,
+    /// `<thought>`, `<|begin_of_thought|>`) in their streaming output. The
+    /// OpenWebUI server converts these to `<details type="reasoning">` blocks
+    /// *after* streaming completes. During streaming the app receives the raw
+    /// tags which would otherwise render as visible text.
+    ///
+    /// **Incomplete `<details>` blocks** — During streaming, the server may
+    /// have started building a `<details type="reasoning">` block but the
+    /// closing `</details>` hasn't arrived yet. Without this, the `<summary>`
+    /// tag inside leaks as visible text.
+    ///
+    /// ## Cases
+    /// 1. **Complete pair**: `<think>content</think>` → done reasoning block
+    /// 2. **Unclosed tag**: `<think>content` (mid-stream) → in-progress block
+    /// 3. **Incomplete details block**: `<details type="reasoning"><summary>…` → in-progress block
+    /// 4. **No matching tags**: content returned unchanged
+    private static func preprocessThinkTags(_ content: String) -> String {
+        var result = content
+
+        // ── Phase 1: Convert raw model reasoning tags ──
+        for pair in defaultReasoningTagPairs {
+            // Quick check: skip this pair entirely if the open tag isn't present
+            guard result.contains(pair.open) else { continue }
+
+            let escapedOpen = NSRegularExpression.escapedPattern(for: pair.open)
+            let escapedClose = NSRegularExpression.escapedPattern(for: pair.close)
+
+            // Case 1: Complete pairs (thinking finished)
+            if let completeRegex = try? NSRegularExpression(
+                pattern: "\(escapedOpen)([\\s\\S]*?)\(escapedClose)",
+                options: [.dotMatchesLineSeparators]
+            ) {
+                let nsResult = result as NSString
+                let matches = completeRegex.matches(
+                    in: result,
+                    range: NSRange(location: 0, length: nsResult.length)
+                )
+                for match in matches.reversed() where match.numberOfRanges > 1 {
+                    let thinkContent = nsResult.substring(with: match.range(at: 1))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let replacement = """
+                    <details type="reasoning" done="true">\
+                    <summary>Thinking</summary>\
+                    \(thinkContent)\
+                    </details>
+                    """
+                    result = (result as NSString).replacingCharacters(in: match.range, with: replacement)
+                }
+            }
+
+            // Case 2: Unclosed tag (still streaming thinking content)
+            if result.contains(pair.open) {
+                if let openRegex = try? NSRegularExpression(
+                    pattern: "\(escapedOpen)([\\s\\S]*)$",
+                    options: [.dotMatchesLineSeparators]
+                ) {
+                    let nsResult = result as NSString
+                    if let match = openRegex.firstMatch(
+                        in: result,
+                        range: NSRange(location: 0, length: nsResult.length)
+                    ), match.numberOfRanges > 1 {
+                        let thinkContent = nsResult.substring(with: match.range(at: 1))
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        let replacement = """
+                        <details type="reasoning" done="false">\
+                        <summary>Thinking</summary>\
+                        \(thinkContent)\
+                        </details>
+                        """
+                        result = (result as NSString).replacingCharacters(in: match.range, with: replacement)
+                    }
+                }
+            }
+        }
+
+        // ── Phase 2: Handle incomplete <details type="reasoning"> blocks ──
+        // During streaming, the server may have started a <details> block but
+        // </details> hasn't arrived yet. The main parser's regex requires the
+        // closing tag, so the partial block passes through as raw text — with
+        // <summary> tags visible to the user.
+        // Detect an unclosed <details type="reasoning"...> and wrap it properly.
+        if result.contains("<details") && !result.isEmpty {
+            if let incompleteRegex = try? NSRegularExpression(
+                pattern: #"(<details\s+[^>]*type\s*=\s*["']reasoning["'][^>]*>)([\s\S]*)$"#,
+                options: [.dotMatchesLineSeparators]
+            ) {
+                let nsResult = result as NSString
+                // Only act if there's an opening <details> without a matching </details>
+                // We check by counting opens vs closes for reasoning details
+                let openCount = countOccurrences(of: #"<details\s+[^>]*type\s*=\s*["']reasoning["']"#, in: result)
+                let closeCount = countOccurrences(of: "</details>", in: result)
+
+                if openCount > closeCount {
+                    // Find the LAST unclosed opening tag
+                    let allMatches = incompleteRegex.matches(
+                        in: result,
+                        range: NSRange(location: 0, length: nsResult.length)
+                    )
+                    if let match = allMatches.last, match.numberOfRanges > 2 {
+                        let innerContent = nsResult.substring(with: match.range(at: 2))
+
+                        // Extract summary if present, strip it from content
+                        var summary = "Thinking"
+                        var bodyContent = innerContent
+                        if let summaryRegex = try? NSRegularExpression(
+                            pattern: #"<summary>([\s\S]*?)</summary>"#,
+                            options: [.dotMatchesLineSeparators]
+                        ) {
+                            let nsInner = innerContent as NSString
+                            if let sMatch = summaryRegex.firstMatch(
+                                in: innerContent,
+                                range: NSRange(location: 0, length: nsInner.length)
+                            ), sMatch.numberOfRanges > 1 {
+                                summary = nsInner.substring(with: sMatch.range(at: 1))
+                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                bodyContent = (innerContent as NSString)
+                                    .replacingCharacters(in: sMatch.range, with: "")
+                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                            } else {
+                                // Partial <summary> without closing — strip it
+                                if let partialSummary = try? NSRegularExpression(
+                                    pattern: #"<summary>([\s\S]*)$"#,
+                                    options: [.dotMatchesLineSeparators]
+                                ) {
+                                    let nsInner2 = bodyContent as NSString
+                                    if let psMatch = partialSummary.firstMatch(
+                                        in: bodyContent,
+                                        range: NSRange(location: 0, length: nsInner2.length)
+                                    ), psMatch.numberOfRanges > 1 {
+                                        summary = nsInner2.substring(with: psMatch.range(at: 1))
+                                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                                        if summary.isEmpty { summary = "Thinking" }
+                                        bodyContent = (bodyContent as NSString)
+                                            .replacingCharacters(in: psMatch.range, with: "")
+                                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                                    }
+                                }
+                            }
+                        }
+
+                        // Rebuild as a complete details block (in-progress)
+                        let replacement = """
+                        <details type="reasoning" done="false">\
+                        <summary>\(summary)</summary>\
+                        \(bodyContent)\
+                        </details>
+                        """
+                        result = (result as NSString).replacingCharacters(in: match.range, with: replacement)
+                    }
+                }
+            }
+        }
+
+        return result
+    }
+
+    /// Counts regex occurrences in a string.
+    private static func countOccurrences(of pattern: String, in text: String) -> Int {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else { return 0 }
+        return regex.numberOfMatches(in: text, range: NSRange(location: 0, length: (text as NSString).length))
     }
 
     /// Extracts an HTML attribute value from a tag string.

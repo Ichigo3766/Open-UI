@@ -1,6 +1,21 @@
 # Changelog
 
-## v2.1.0 — March 27, 2026
+## v2.2 — March 28, 2026
+
+### What's New
+- Added pinned models — star any model in the model picker to pin it for quick access. Pinned models appear in a dedicated section at the top of the picker and as shortcuts in the sidebar, synced with your Open WebUI server.
+- Model picker now shows the currently selected model at the top of the sheet for easy reference.
+
+### Improvements
+- Home screen widgets with full theme support — widgets now properly adapt to Default, Dark, Clear, and Tinted modes instead of being stuck on a dark background.
+
+### Bug Fixes
+- Fixed thinking/reasoning blocks from models (Qwen, DeepSeek, etc.) showing as raw tags in the chat instead of rendering as a collapsible "Thinking" section. Now handles all six reasoning tag formats during streaming and fixes stray summary tags leaking mid-stream.
+- Fixed on-device audio transcription cutting off the last portion (and many words throughout) of uploaded audio.
+
+## Previous Builds
+
+## v2.1 — March 27, 2026
 
 ### What's New
 - Admins can now edit any model's settings directly from the model picker — tap the  icon next to any model to open the full model editor without leaving the chat.

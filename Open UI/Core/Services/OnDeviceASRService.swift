@@ -288,7 +288,16 @@ final class OnDeviceASRService {
         let totalDuration = Double(totalSamples) / Double(sampleRate)
         logger.info("Audio loaded: \(String(format: "%.1f", totalDuration))s at \(sampleRate)Hz")
 
-        let streamParams = STTGenerateParameters(chunkDuration: 30)
+        // Use generate() instead of generateStream() for file transcription.
+        // generate() uses 15s overlap between 30s chunks (vs 1s in streaming),
+        // which produces far better merge quality and prevents audio cutoff at
+        // chunk boundaries — especially for the last chunk.
+        // language: nil lets the model auto-detect (Parakeet is English-only,
+        // but we don't hardcode it).
+        let params = STTGenerateParameters(
+            language: nil,
+            chunkDuration: 30
+        )
 
         // Pre-capture the model reference on the main actor before the detached task.
         // nonisolated(unsafe) — no await needed; direct read is safe here because
@@ -299,21 +308,12 @@ final class OnDeviceASRService {
         // Create the transcription task and register it so pauseForBackground() can cancel it.
         let transcriptionTask = Task.detached(priority: .userInitiated) {
             guard let model = capturedModel else { throw ASRError.modelNotLoaded }
-            var text = ""
-            for try await event in model.generateStream(audio: audioArray, generationParameters: streamParams) {
-                // Check for cancellation between chunks so background pausing
-                // exits cleanly without waiting for the next Metal command buffer.
-                try Task.checkCancellation()
-                switch event {
-                case .token(let token):
-                    text += token
-                case .result(let output):
-                    text = output.text
-                case .info(let info):
-                    logger.debug("Parakeet: \(String(format: "%.1f", info.tokensPerSecond)) tok/s, peak \(String(format: "%.2f", info.peakMemoryUsage))GB")
-                }
-            }
-            return text
+            // Check for cancellation before starting the (potentially long) generate pass.
+            try Task.checkCancellation()
+            let output = model.generate(audio: audioArray, generationParameters: params)
+            // Check again after — if cancelled during generate(), this throws.
+            try Task.checkCancellation()
+            return output.text
         }
 
         // Store on main actor so pauseForBackground() can cancel it.

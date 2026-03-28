@@ -26,26 +26,6 @@ struct ToolItem: Identifiable, Hashable {
 
 /// A bottom sheet presenting attachment actions, feature toggles (web search),
 /// and an expandable list of available tools.
-///
-/// Mirrors the Flutter ``ModernChatInput`` overflow sheet layout:
-/// - Row of attachment action buttons (file, photo, camera, webpage)
-/// - Feature toggle tiles (web search with description)
-/// - Expandable tools list with toggle pills
-///
-/// Usage:
-/// ```swift
-/// .sheet(isPresented: $showTools) {
-///     ToolsMenuSheet(
-///         webSearchEnabled: $webSearchEnabled,
-///         tools: tools,
-///         selectedToolIds: $selectedToolIds,
-///         onFileAttachment: { ... },
-///         onPhotoAttachment: { ... },
-///         onCameraCapture: { ... },
-///         onWebAttachment: { ... }
-///     )
-/// }
-/// ```
 struct ToolsMenuSheet: View {
     @Binding var webSearchEnabled: Bool
     @Binding var imageGenerationEnabled: Bool

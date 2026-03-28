@@ -67,6 +67,8 @@ final class ChatViewModel {
     /// Whether memory is enabled for this chat session.
     /// Persisted to server user settings (`ui.memory`) so the web UI stays in sync.
     var memoryEnabled: Bool = false
+    /// Pinned model IDs synced with server `ui.pinnedModels`.
+    var pinnedModelIds: [String] = []
     var isTemporaryChat: Bool = false
     var availableTools: [ToolItem] = []
     var selectedToolIds: Set<String> = [] {
@@ -3840,6 +3842,63 @@ final class ChatViewModel {
                 logger.debug("Memory setting saved to server: \(enabled)")
             } catch {
                 logger.debug("Failed to save memory setting: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // MARK: - Pinned Models
+
+    /// Fetches the user's pinned model IDs from the server.
+    ///
+    /// Reads `ui.pinnedModels` from `GET /api/v1/users/user/settings`.
+    /// Uses session-level cache to avoid redundant fetches.
+    func fetchPinnedModels() async {
+        // Use session-level cache
+        if let cached = activeChatStore?.cachedPinnedModelIds {
+            pinnedModelIds = cached
+            return
+        }
+        guard let apiClient = manager?.apiClient else { return }
+        do {
+            let settings = try await apiClient.getUserSettings()
+            if let ui = settings["ui"] as? [String: Any],
+               let pinned = ui["pinnedModels"] as? [String] {
+                pinnedModelIds = pinned
+                activeChatStore?.cachedPinnedModelIds = pinned
+                logger.debug("Pinned models fetched: \(pinned)")
+            }
+        } catch {
+            logger.debug("Failed to fetch pinned models: \(error.localizedDescription)")
+        }
+    }
+
+    /// Toggles a model's pinned state and syncs to the server.
+    ///
+    /// Calls `POST /api/v1/users/user/settings/update` with
+    /// `{"ui": {"models": [...], "pinnedModels": [...]}}` matching the web UI format.
+    func togglePinModel(_ modelId: String) {
+        if pinnedModelIds.contains(modelId) {
+            pinnedModelIds.removeAll { $0 == modelId }
+        } else {
+            pinnedModelIds.append(modelId)
+        }
+        // Update cache immediately
+        activeChatStore?.cachedPinnedModelIds = pinnedModelIds
+
+        // Sync to server (fire-and-forget)
+        let currentPinned = pinnedModelIds
+        guard let apiClient = manager?.apiClient else { return }
+        Task {
+            do {
+                try await apiClient.updateUserSettings([
+                    "ui": [
+                        "models": currentPinned,
+                        "pinnedModels": currentPinned
+                    ]
+                ])
+                logger.debug("Pinned models saved to server: \(currentPinned)")
+            } catch {
+                logger.debug("Failed to save pinned models: \(error.localizedDescription)")
             }
         }
     }

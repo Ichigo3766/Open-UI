@@ -3,8 +3,8 @@
 //  OpenUIWidgets
 //
 //  Open UI widget suite — action-focused, instant-launch widgets.
-//  Gemini-style: full-bleed circles, real app icon, minimal padding.
-//  Uses UIKit semantic colors so dark/light mode follow the system automatically.
+//  Modern adaptive design: supports Default, Dark, Clear, and Tinted modes.
+//  Uses SwiftUI system materials and widgetRenderingMode for full theme support.
 //
 
 import WidgetKit
@@ -21,32 +21,6 @@ private enum OpenUIURL {
     static let newChannel = URL(string: "openui://new-channel")!
 }
 
-// MARK: - Semantic Adaptive Colors
-//
-// These UIKit system colors automatically switch between light and dark mode
-// without reading @Environment(\.colorScheme), which is unreliable in widget
-// extensions. No custom color math needed.
-
-private extension Color {
-    /// Widget canvas background — white in light mode, near-black in dark mode.
-    static let widgetBg          = Color(uiColor: .systemBackground)
-
-    /// Circle / pill fills — light gray in light, dark gray in dark.
-    static let widgetCircleFill  = Color(uiColor: .secondarySystemBackground)
-
-    /// Slightly lighter secondary fill (used for medium action circles).
-    static let widgetPillFill    = Color(uiColor: .secondarySystemBackground)
-
-    /// Search bar border stroke.
-    static let widgetStroke      = Color(uiColor: .separator)
-
-    /// Primary icon tint — black in light, white in dark.
-    static let widgetIconFg      = Color(uiColor: .label)
-
-    /// Secondary text / icon tint — gray in both modes.
-    static let widgetSecondaryFg = Color(uiColor: .secondaryLabel)
-}
-
 // MARK: - Static Timeline Provider
 
 struct ActionEntry: TimelineEntry {
@@ -55,10 +29,12 @@ struct ActionEntry: TimelineEntry {
 
 struct StaticActionProvider: TimelineProvider {
     func placeholder(in context: Context) -> ActionEntry { ActionEntry(date: .now) }
-    func getSnapshot(in context: Context, completion: @escaping (ActionEntry) -> Void) {
+
+    func getSnapshot(in context: Context, completion: @escaping @Sendable (ActionEntry) -> Void) {
         completion(ActionEntry(date: .now))
     }
-    func getTimeline(in context: Context, completion: @escaping (Timeline<ActionEntry>) -> Void) {
+
+    func getTimeline(in context: Context, completion: @escaping @Sendable (Timeline<ActionEntry>) -> Void) {
         let next = Calendar.current.date(byAdding: .day, value: 1, to: .now) ?? .now
         completion(Timeline(entries: [ActionEntry(date: .now)], policy: .after(next)))
     }
@@ -66,7 +42,6 @@ struct StaticActionProvider: TimelineProvider {
 
 // MARK: - ═══════════════════════════════════════════
 // MARK:   WIDGET 1: Quick Actions (Small + Medium)
-//         Single resizable widget — drag to resize
 // MARK: ═══════════════════════════════════════════
 
 struct QuickActionsWidget: Widget {
@@ -74,7 +49,7 @@ struct QuickActionsWidget: Widget {
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: kind, provider: StaticActionProvider()) { _ in
             QuickActionsWidgetView()
-                .containerBackground(Color.widgetBg, for: .widget)
+                .containerBackground(.fill.tertiary, for: .widget)
         }
         .configurationDisplayName("Open Relay")
         .description("Instantly start a chat, voice call, camera chat, or file chat.")
@@ -91,10 +66,8 @@ struct QuickActionsWidgetView: View {
         switch family {
         case .systemMedium:
             QuickActionsMediumView()
-                .background(Color.widgetBg)
         default:
             QuickActionsSmallView()
-                .background(Color.widgetBg)
         }
     }
 }
@@ -104,6 +77,7 @@ struct QuickActionsWidgetView: View {
 // MARK: ═══════════════════════════════════════════
 
 struct QuickActionsSmallView: View {
+    @Environment(\.widgetRenderingMode) private var renderingMode
     private let gap: CGFloat = 5
     private let inset: CGFloat = 8
 
@@ -119,51 +93,73 @@ struct QuickActionsSmallView: View {
                 HStack(spacing: gap) {
                     // App icon (new chat)
                     Link(destination: OpenUIURL.newChat) {
-                        ZStack {
-                            Circle().fill(Color.widgetCircleFill)
+                        SmallCircleButton(size: size) {
                             Image("AppIconImage")
                                 .resizable()
+                                .widgetAccentedRenderingMode(.fullColor)
                                 .scaledToFill()
                                 .frame(width: size * 0.55, height: size * 0.55)
                                 .clipShape(RoundedRectangle(cornerRadius: size * 0.12, style: .continuous))
                         }
-                        .frame(width: size, height: size)
                     }
                     // Mic (voice call)
                     Link(destination: OpenUIURL.voiceCall) {
-                        ZStack {
-                            Circle().fill(Color.widgetCircleFill)
+                        SmallCircleButton(size: size) {
                             Image(systemName: "mic.fill")
                                 .font(.system(size: size * 0.34, weight: .bold))
-                                .foregroundStyle(Color.widgetIconFg)
+                                .foregroundStyle(.primary)
+                                .widgetAccentable()
                         }
-                        .frame(width: size, height: size)
                     }
                 }
                 HStack(spacing: gap) {
                     // Camera
                     Link(destination: OpenUIURL.cameraChat) {
-                        ZStack {
-                            Circle().fill(Color.widgetCircleFill)
+                        SmallCircleButton(size: size) {
                             Image(systemName: "camera.fill")
                                 .font(.system(size: size * 0.34, weight: .bold))
-                                .foregroundStyle(Color.widgetIconFg)
+                                .foregroundStyle(.primary)
+                                .widgetAccentable()
                         }
-                        .frame(width: size, height: size)
                     }
                     // Files
                     Link(destination: OpenUIURL.fileChat) {
-                        ZStack {
-                            Circle().fill(Color.widgetCircleFill)
+                        SmallCircleButton(size: size) {
                             Image(systemName: "paperclip")
                                 .font(.system(size: size * 0.34, weight: .bold))
-                                .foregroundStyle(Color.widgetIconFg)
+                                .foregroundStyle(.primary)
+                                .widgetAccentable()
                         }
-                        .frame(width: size, height: size)
                     }
                 }
             }
             .frame(width: w, height: h)
+        }
+    }
+}
+
+/// A circle button that adapts its fill based on widget rendering mode.
+private struct SmallCircleButton<Content: View>: View {
+    let size: CGFloat
+    @ViewBuilder let content: Content
+    @Environment(\.widgetRenderingMode) private var renderingMode
+
+    var body: some View {
+        ZStack {
+            adaptiveCircle
+            content
+        }
+        .frame(width: size, height: size)
+    }
+
+    @ViewBuilder
+    private var adaptiveCircle: some View {
+        if renderingMode == .vibrant {
+            Circle().fill(.fill.tertiary)
+        } else if renderingMode == .accented {
+            Circle().fill(.fill.tertiary).widgetAccentable()
+        } else {
+            Circle().fill(.fill.quaternary)
         }
     }
 }
@@ -176,7 +172,7 @@ struct QuickActionsMediumView: View {
     var body: some View {
         GeometryReader { geo in
             VStack(spacing: 10) {
-                // ── "Ask Open UI" pill ──
+                // ── "Ask Open Relay" pill ──
                 MediumSearchBar(width: geo.size.width - 20)
 
                 // ── Action buttons: Camera · Photos · Channel · Files ──
@@ -195,6 +191,7 @@ struct QuickActionsMediumView: View {
 /// Search bar pill with two independent Link zones.
 private struct MediumSearchBar: View {
     let width: CGFloat
+    @Environment(\.widgetRenderingMode) private var renderingMode
 
     var body: some View {
         ZStack(alignment: .trailing) {
@@ -203,13 +200,14 @@ private struct MediumSearchBar: View {
                 HStack(spacing: 10) {
                     Image("AppIconImage")
                         .resizable()
+                        .widgetAccentedRenderingMode(.fullColor)
                         .scaledToFill()
                         .frame(width: 28, height: 28)
                         .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
 
                     Text("Ask Open Relay")
                         .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(Color.widgetSecondaryFg)
+                        .foregroundStyle(.secondary)
 
                     Spacer()
                 }
@@ -222,7 +220,8 @@ private struct MediumSearchBar: View {
             Link(destination: OpenUIURL.voiceCall) {
                 Image(systemName: "mic.fill")
                     .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(Color.widgetSecondaryFg)
+                    .foregroundStyle(.secondary)
+                    .widgetAccentable()
                     .frame(width: 48, height: 48)
                     .contentShape(Rectangle())
             }
@@ -230,12 +229,20 @@ private struct MediumSearchBar: View {
         }
         .frame(width: width)
         .background(
-            Capsule().fill(Color.widgetPillFill)
+            Capsule().fill(searchBarFill)
         )
         .overlay(
             Capsule()
-                .strokeBorder(Color.widgetStroke, lineWidth: 0.75)
+                .strokeBorder(searchBarStroke, lineWidth: 0.75)
         )
+    }
+
+    private var searchBarFill: some ShapeStyle {
+        .fill.tertiary
+    }
+
+    private var searchBarStroke: some ShapeStyle {
+        .fill.secondary
     }
 }
 
@@ -243,23 +250,35 @@ private struct MediumActionButton: View {
     let systemName: String
     let label: String
     let url: URL
+    @Environment(\.widgetRenderingMode) private var renderingMode
 
     var body: some View {
         Link(destination: url) {
             VStack(spacing: 6) {
                 ZStack {
-                    Circle()
-                        .fill(Color.widgetPillFill)
+                    circleFill
                         .frame(width: 48, height: 48)
                     Image(systemName: systemName)
                         .font(.system(size: 20, weight: .bold))
-                        .foregroundStyle(Color.widgetIconFg)
+                        .foregroundStyle(.primary)
+                        .widgetAccentable()
                 }
                 Text(label)
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color.widgetSecondaryFg)
+                    .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var circleFill: some View {
+        if renderingMode == .vibrant {
+            Circle().fill(.fill.tertiary)
+        } else if renderingMode == .accented {
+            Circle().fill(.fill.tertiary).widgetAccentable()
+        } else {
+            Circle().fill(.fill.quaternary)
         }
     }
 }
@@ -292,6 +311,7 @@ struct LockScreenWidgetView: View {
                     AccessoryWidgetBackground()
                     Image(systemName: "bubble.left.and.text.bubble.right.fill")
                         .font(.system(size: 18, weight: .medium))
+                        .widgetAccentable()
                 }
             }
         case .accessoryRectangular:
@@ -299,6 +319,7 @@ struct LockScreenWidgetView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "bubble.left.and.text.bubble.right.fill")
                         .font(.system(size: 14, weight: .semibold))
+                        .widgetAccentable()
                     VStack(alignment: .leading, spacing: 1) {
                         Text("Open Relay")
                             .font(.system(size: 13, weight: .semibold))
@@ -316,6 +337,7 @@ struct LockScreenWidgetView: View {
         default:
             Link(destination: OpenUIURL.newChat) {
                 Image(systemName: "bubble.left.and.text.bubble.right.fill")
+                    .widgetAccentable()
             }
         }
     }

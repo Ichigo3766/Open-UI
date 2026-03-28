@@ -1157,6 +1157,9 @@ struct MainChatView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
 
+                    // ── PINNED MODELS SECTION (quick-switch shortcuts) ─
+                    drawerPinnedModelsSection
+
                     // ── FOLDERS SECTION (always visible so user can create new folders) ─
                     let folderVM = listViewModel.folderViewModel
                     if !folderVM.featureDisabled {
@@ -1555,6 +1558,83 @@ struct MainChatView: View {
             .padding(.vertical, Spacing.sm)
 
             content()
+        }
+    }
+
+    // MARK: - Drawer Pinned Models Section
+
+    /// Shows pinned models as quick-switch shortcuts in the sidebar,
+    /// matching the web UI's "Models" section above folders.
+    @ViewBuilder
+    private var drawerPinnedModelsSection: some View {
+        let vm = dependencies.activeChatStore.viewModel(for: activeConversationId)
+        let pinnedIds = vm.pinnedModelIds
+        let models = vm.availableModels
+        let pinnedModels = pinnedIds.compactMap { id in models.first(where: { $0.id == id }) }
+
+        if !pinnedModels.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                // Section header
+                HStack(spacing: 6) {
+                    Image(systemName: "cpu")
+                        .scaledFont(size: 10, weight: .semibold)
+                        .foregroundStyle(theme.textTertiary)
+                    Text("Models")
+                        .scaledFont(size: 12, weight: .medium)
+                        .fontWeight(.bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .textCase(.uppercase)
+                        .tracking(0.5)
+                    Spacer()
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, Spacing.sm)
+
+                // Pinned model rows
+                ForEach(pinnedModels) { model in
+                    let isSelected = model.id == vm.selectedModelId
+                    Button {
+                        let modelId = model.id
+                        startNewChat()
+                        let newVM = dependencies.activeChatStore.viewModel(for: nil)
+                        newVM.selectModel(modelId)
+                        closeDrawer()
+                    } label: {
+                        HStack(spacing: 8) {
+                            ModelAvatar(
+                                size: 22,
+                                imageURL: vm.resolvedImageURL(for: model),
+                                label: model.shortName,
+                                authToken: vm.serverAuthToken
+                            )
+                            Text(model.shortName)
+                                .scaledFont(size: 14)
+                                .fontWeight(isSelected ? .semibold : .regular)
+                                .foregroundStyle(isSelected ? theme.textPrimary : theme.textSecondary)
+                                .lineLimit(1)
+                            Spacer()
+                            if isSelected {
+                                Image(systemName: "checkmark")
+                                    .scaledFont(size: 11, weight: .semibold)
+                                    .foregroundStyle(theme.brandPrimary)
+                            }
+                        }
+                        .padding(.horizontal, Spacing.md)
+                        .padding(.vertical, 7)
+                        .background(isSelected ? theme.brandPrimary.opacity(0.08) : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // Divider below models
+            Rectangle()
+                .fill(theme.textTertiary.opacity(0.15))
+                .frame(height: 1)
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, Spacing.sm)
         }
     }
 
@@ -2295,10 +2375,14 @@ let conversationId: String?
                         serverBaseURL: vm.serverBaseURL,
                         authToken: vm.serverAuthToken,
                         isAdmin: dependencies.authViewModel.currentUser?.role == .admin,
+                        pinnedModelIds: vm.pinnedModelIds,
                         onEdit: dependencies.authViewModel.currentUser?.role == .admin ? { model in
                             isShowingModelSelectorSheet = false
                             Task { await openModelEditor(for: model) }
                         } : nil,
+                        onTogglePin: { modelId in
+                            vm.togglePinModel(modelId)
+                        },
                         onSelect: { model in
                             vm.selectModel(model.id)
                         }

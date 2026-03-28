@@ -55,6 +55,11 @@ final class ActiveChatStore {
     /// always fetches a fresh value.
     var cachedMemorySetting: Bool? = nil
 
+    /// Session-level cache for pinned model IDs from `ui.pinnedModels`.
+    /// Populated by the first ChatViewModel that fetches user settings,
+    /// then reused by all subsequent VMs. Cleared on logout/server switch.
+    var cachedPinnedModelIds: [String]? = nil
+
     /// Returns an existing view model or creates a new one for the given
     /// conversation ID.  Pass `nil` for a brand-new conversation.
     ///
@@ -129,6 +134,7 @@ final class ActiveChatStore {
         cachedModels = []
         cachedSelectedModelId = nil
         cachedMemorySetting = nil
+        cachedPinnedModelIds = nil
     }
 }
 

@@ -658,6 +658,9 @@ struct iPadSidebarContent: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     let folderVM = listViewModel.folderViewModel
 
+                    // Pinned models section (quick-switch shortcuts)
+                    pinnedModelsSection
+
                     // Folders section
                     if !folderVM.featureDisabled {
                         foldersSection(folderVM: folderVM)
@@ -843,6 +846,82 @@ struct iPadSidebarContent: View {
         .background(theme.surfaceContainer.opacity(0.4))
         .padding(.top, Spacing.sm)
         .padding(.bottom, Spacing.xs)
+    }
+
+    // MARK: - Pinned Models Section
+
+    /// Shows pinned models as quick-switch shortcuts in the sidebar,
+    /// matching the web UI's "Models" section above folders.
+    @ViewBuilder
+    private var pinnedModelsSection: some View {
+        let vm = dependencies.activeChatStore.viewModel(for: activeConversationId)
+        let pinnedIds = vm.pinnedModelIds
+        let models = vm.availableModels
+        let pinnedModels = pinnedIds.compactMap { id in models.first(where: { $0.id == id }) }
+
+        if !pinnedModels.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                // Section header
+                HStack(spacing: 6) {
+                    Image(systemName: "cpu")
+                        .scaledFont(size: 9, weight: .semibold)
+                        .foregroundStyle(theme.textTertiary)
+                    Text("Models")
+                        .scaledFont(size: 12, weight: .medium)
+                        .fontWeight(.bold)
+                        .foregroundStyle(theme.textTertiary)
+                        .textCase(.uppercase)
+                        .tracking(0.5)
+                    Spacer()
+                }
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, Spacing.sm)
+
+                // Pinned model rows
+                ForEach(pinnedModels) { model in
+                    let isSelected = model.id == vm.selectedModelId
+                    Button {
+                        let modelId = model.id
+                        onNewChat()
+                        let newVM = dependencies.activeChatStore.viewModel(for: nil)
+                        newVM.selectModel(modelId)
+                    } label: {
+                        HStack(spacing: 8) {
+                            ModelAvatar(
+                                size: 22,
+                                imageURL: vm.resolvedImageURL(for: model),
+                                label: model.shortName,
+                                authToken: vm.serverAuthToken
+                            )
+                            Text(model.shortName)
+                                .scaledFont(size: 14)
+                                .fontWeight(isSelected ? .semibold : .regular)
+                                .foregroundStyle(isSelected ? theme.textPrimary : theme.textSecondary)
+                                .lineLimit(1)
+                            Spacer()
+                            if isSelected {
+                                Image(systemName: "checkmark")
+                                    .scaledFont(size: 11, weight: .semibold)
+                                    .foregroundStyle(theme.brandPrimary)
+                            }
+                        }
+                        .padding(.horizontal, Spacing.md)
+                        .padding(.vertical, 7)
+                        .background(isSelected ? theme.brandPrimary.opacity(0.1) : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: CornerRadius.sm, style: .continuous))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // Divider below models
+            Rectangle()
+                .fill(theme.textTertiary.opacity(0.12))
+                .frame(height: 1)
+                .padding(.horizontal, Spacing.md)
+                .padding(.vertical, Spacing.sm)
+        }
     }
 
     // MARK: - Folders Section

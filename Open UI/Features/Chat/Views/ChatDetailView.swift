@@ -239,6 +239,7 @@ struct ChatDetailView: View {
             NotificationService.shared.activeConversationId =
                 viewModel.conversationId ?? viewModel.conversation?.id
             await viewModel.load()
+            await viewModel.fetchPinnedModels()
         }
         // Reactive fallback: if backendConfig wasn't ready when .task ran
         // (first app launch), rebuild prompts as soon as the config arrives.
@@ -491,10 +492,14 @@ struct ChatDetailView: View {
                         serverBaseURL: viewModel.serverBaseURL,
                         authToken: viewModel.serverAuthToken,
                         isAdmin: dependencies.authViewModel.currentUser?.role == .admin,
+                        pinnedModelIds: viewModel.pinnedModelIds,
                         onEdit: dependencies.authViewModel.currentUser?.role == .admin ? { model in
                             isShowingModelSelectorSheet = false
                             Task { await openModelEditorFromPicker(model) }
                         } : nil,
+                        onTogglePin: { modelId in
+                            viewModel.togglePinModel(modelId)
+                        },
                         onSelect: { model in
                             withAnimation(MicroAnimation.snappy) {
                                 viewModel.selectModel(model.id)

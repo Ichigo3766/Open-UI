@@ -19,7 +19,9 @@ struct ModelSelectorSheet: View {
     let serverBaseURL: String
     let authToken: String?
     let isAdmin: Bool
+    let pinnedModelIds: [String]
     let onEdit: ((AIModel) -> Void)?
+    let onTogglePin: ((String) -> Void)?
     let onSelect: (AIModel) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -296,6 +298,26 @@ struct ModelSelectorSheet: View {
         .buttonStyle(.plain)
     }
 
+    // MARK: - Section Computation
+
+    /// The currently selected model (if it passes filters).
+    private var currentModel: AIModel? {
+        guard let id = selectedModelId else { return nil }
+        return filteredModels.first { $0.id == id }
+    }
+
+    /// Pinned models that pass filters, excluding the currently selected model.
+    private var pinnedModels: [AIModel] {
+        let pinnedSet = Set(pinnedModelIds)
+        return filteredModels.filter { pinnedSet.contains($0.id) && $0.id != selectedModelId }
+    }
+
+    /// All remaining models (not selected, not pinned) that pass filters.
+    private var remainingModels: [AIModel] {
+        let pinnedSet = Set(pinnedModelIds)
+        return filteredModels.filter { $0.id != selectedModelId && !pinnedSet.contains($0.id) }
+    }
+
     // MARK: - Model List
 
     @ViewBuilder
@@ -307,25 +329,148 @@ struct ModelSelectorSheet: View {
         } else {
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(Array(filteredModels.enumerated()), id: \.element.id) { idx, model in
-                        EquatableModelRow(
-                            model: model,
-                            isSelected: model.id == selectedModelId,
-                            isLast: idx == filteredModels.count - 1,
-                            serverBaseURL: serverBaseURL,
-                            authToken: authToken,
-                            isAdmin: isAdmin,
-                            onEdit: onEdit != nil ? { onEdit?(model) } : nil,
-                            onTap: {
-                                Haptics.play(.light)
-                                onSelect(model)
-                                dismiss()
-                            }
-                        )
+                    // ── CURRENTLY SELECTED ──
+                    if let current = currentModel {
+                        sectionHeader("Currently Selected")
+                        modelRow(current, isLast: pinnedModels.isEmpty && remainingModels.isEmpty)
+                    }
+
+                    // ── PINNED ──
+                    if !pinnedModels.isEmpty {
+                        sectionHeader("Pinned")
+                        ForEach(Array(pinnedModels.enumerated()), id: \.element.id) { idx, model in
+                            modelRow(model, isLast: idx == pinnedModels.count - 1 && remainingModels.isEmpty)
+                        }
+                    }
+
+                    // ── ALL MODELS ──
+                    if !remainingModels.isEmpty {
+                        sectionHeader("All Models")
+                        ForEach(Array(remainingModels.enumerated()), id: \.element.id) { idx, model in
+                            modelRow(model, isLast: idx == remainingModels.count - 1)
+                        }
                     }
                 }
             }
             .scrollDismissesKeyboard(.interactively)
+        }
+    }
+
+    // MARK: - Section Header
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title.uppercased())
+            .scaledFont(size: 11, weight: .semibold)
+            .foregroundStyle(theme.textTertiary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 6)
+    }
+
+    // MARK: - Model Row (with pin button)
+
+    private func modelRow(_ model: AIModel, isLast: Bool) -> some View {
+        let isPinned = pinnedModelIds.contains(model.id)
+        let isSelected = model.id == selectedModelId
+
+        return VStack(spacing: 0) {
+            Button {
+                Haptics.play(.light)
+                onSelect(model)
+                dismiss()
+            } label: {
+                HStack(spacing: 12) {
+                    ModelAvatar(
+                        size: 36,
+                        imageURL: model.resolveAvatarURL(baseURL: serverBaseURL),
+                        label: model.shortName,
+                        authToken: authToken
+                    )
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.name)
+                            .scaledFont(size: 15, weight: .semibold)
+                            .foregroundStyle(theme.textPrimary)
+                            .lineLimit(1)
+
+                        modelSubtitle(model)
+                    }
+
+                    Spacer(minLength: 0)
+
+                    // Pin/unpin button
+                    if let onTogglePin {
+                        Button {
+                            Haptics.play(.light)
+                            onTogglePin(model.id)
+                        } label: {
+                            Image(systemName: isPinned ? "star.fill" : "star")
+                                .scaledFont(size: 14, weight: .medium)
+                                .foregroundStyle(isPinned ? .yellow : theme.textTertiary)
+                                .frame(width: 32, height: 32)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    // Admin edit button
+                    if isAdmin, let onEdit {
+                        Button {
+                            Haptics.play(.light)
+                            onEdit(model)
+                        } label: {
+                            Image(systemName: "slider.horizontal.3")
+                                .scaledFont(size: 14, weight: .medium)
+                                .foregroundStyle(theme.textTertiary)
+                                .frame(width: 32, height: 32)
+                                .background(theme.surfaceContainer.opacity(0.7))
+                                .clipShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    // Checkmark for selected model
+                    if isSelected {
+                        Image(systemName: "checkmark")
+                            .scaledFont(size: 14, weight: .semibold)
+                            .foregroundStyle(theme.brandPrimary)
+                            .transition(.scale(scale: 0.7).combined(with: .opacity))
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(ModelRowButtonStyle())
+
+            if !isLast {
+                Divider()
+                    .background(theme.divider.opacity(0.5))
+                    .padding(.leading, 16 + 36 + 12)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func modelSubtitle(_ model: AIModel) -> some View {
+        let desc = model.description?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let contextStr: String? = {
+            guard let ctx = model.contextLength, ctx > 0 else { return nil }
+            if ctx >= 1_000_000 { return "\(ctx / 1_000_000)M ctx" }
+            if ctx >= 1_000 { return "\(ctx / 1_000)K ctx" }
+            return "\(ctx) ctx"
+        }()
+
+        if !desc.isEmpty {
+            Text(desc)
+                .scaledFont(size: 12)
+                .foregroundStyle(theme.textTertiary)
+                .lineLimit(1)
+        } else if let ctx = contextStr {
+            Text(ctx)
+                .scaledFont(size: 12)
+                .foregroundStyle(theme.textTertiary)
         }
     }
 

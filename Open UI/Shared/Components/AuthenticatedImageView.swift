@@ -1,11 +1,6 @@
 import SwiftUI
 
 /// Loads and displays an image from the server using authenticated API calls.
-///
-/// Unlike `AsyncImage`, this view fetches file content through ``APIClient``
-/// which includes auth headers automatically. Matches the Flutter app's
-/// `EnhancedImageAttachment` which uses `api.getFileContent(id)` to load images.
-///
 /// Supports:
 /// - Tap to view full screen with pinch-to-zoom
 /// - Long press context menu with Copy and Share options
